@@ -1,0 +1,332 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+from enum import Enum, auto
+from typing import Dict, List, overload
+
+from omegaconf import DictConfig
+
+from rlinf.scheduler.placement import (
+    PackedPlacementStrategy,
+    PlacementStrategy,
+    StridedPlacementStrategy,
+)
+
+
+class PlacementMode(Enum):
+    COLLOCATED = auto()
+    DISAGGREGATED = auto()
+    HYBRID = auto()
+
+
+class ComponentPlacement:
+    """Base component placement for parsing config."""
+
+    def __init__(self, config: DictConfig):
+        """Parsing component placement configuration.
+
+        Args:
+            config (DictConfig): The configuration dictionary for the component placement.
+        """
+        self._config = config
+        self._placement_config: DictConfig = config.cluster.component_placement
+        self._cluster_num_nodes = config.cluster.num_nodes
+        self._cluster_num_gpus_per_node = config.cluster.num_gpus_per_node
+        self._cluster_num_gpus = (
+            config.cluster.num_gpus_per_node * config.cluster.num_nodes
+        )
+        self._components: List[str] = []
+        self._component_gpu_map: Dict[str, List[int]] = {}
+
+        # Each line of component placement config looks like:
+        # actor,inference: 0-4, which means both the actor and inference groups occupy GPU 0 to 4
+        # Alternatively, "all" can be used to specify all GPUs
+        for components in self._placement_config.keys():
+            components_gpus = self._placement_config[components]
+            components = components.split(",")
+            components = [c.strip() for c in components]
+            if components_gpus == "all":
+                start_gpu = 0
+                end_gpu = self._cluster_num_gpus - 1
+            else:
+                components_gpus = components_gpus.split("-")
+                try:
+                    start_gpu = int(components_gpus[0])
+                    end_gpu = int(components_gpus[1])
+                except (ValueError, IndexError):
+                    raise ValueError(
+                        f"Invalid GPU range for components {components}: {components_gpus}, expected format: start-end"
+                    )
+            assert end_gpu >= start_gpu, (
+                f"Start GPU ID {start_gpu} must be less than or equal to end GPU ID {end_gpu}."
+            )
+            assert start_gpu < self._cluster_num_gpus, (
+                f"Start GPU ID {start_gpu} must be less than total number of GPUs {self._cluster_num_gpus}."
+            )
+            assert end_gpu < self._cluster_num_gpus, (
+                f"End GPU ID {end_gpu} must be less than total number of GPUs {self._cluster_num_gpus}."
+            )
+            components_gpus = list(range(start_gpu, end_gpu + 1))
+
+            for component in components:
+                self._components.append(component)
+                self._component_gpu_map[component] = components_gpus
+
+            self._placements: Dict[str, PlacementStrategy] = {}
+            self._placement_mode: PlacementMode = None
+
+    @property
+    def placement_mode(self):
+        return self._placement_mode
+
+    @property
+    def rollout_world_size(self):
+        raise NotImplementedError
+
+    @property
+    def actor_world_size(self):
+        raise NotImplementedError
+
+    @overload
+    def _generate_placements(self):
+        raise NotImplementedError
+
+    def get_strategy(self, component_name: str):
+        """Get the placement strategy for a component based on the configuration.
+
+        Args:
+            component_name (str): The name of the component to retrieve the placement strategy for.
+
+        Returns:
+            PackedPlacementStrategy: The placement strategy for the specified component.
+        """
+        if len(self._placements.keys()) == 0:
+            self._generate_placements()
+        assert component_name in self._placements, (
+            f"Component {component_name} does not exist in {type(self)} with placement mode {self._placement_mode}"
+        )
+        return self._placements[component_name]
+
+
+class EmbodiedComponentPlacement(ComponentPlacement):
+    """Component placement for Embodied Experiment."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._placement_mode = PlacementMode.HYBRID
+        self._env_gpus = self._component_gpu_map.get("env", None)
+        self._rollout_gpus = self._component_gpu_map.get("rollout", None)
+        self._actor_gpus = self._component_gpu_map.get("actor", None)
+        assert self._env_gpus is not None, (
+            "Environment GPUs must be specified in the component_placement config."
+        )
+        assert self._rollout_gpus is not None, (
+            "Rollout GPUs must be specified in the component_placement config."
+        )
+        assert self._actor_gpus is not None, (
+            "Actor GPUs must be specified in the component_placement config."
+        )
+        self._env_num_gpus = len(self._env_gpus)
+        self._rollout_num_gpus = len(self._rollout_gpus)
+        self._actor_num_gpus = len(self._actor_gpus)
+
+    @property
+    def env_world_size(self):
+        return self._env_num_gpus
+
+    @property
+    def rollout_world_size(self):
+        return self._rollout_num_gpus
+
+    @property
+    def actor_world_size(self):
+        return self._actor_num_gpus
+
+    def _generate_placements(self):
+        self._placements["env"] = PackedPlacementStrategy.from_gpu_range(
+            self._env_gpus, self._env_num_gpus, self._cluster_num_gpus_per_node
+        )
+        self._placements["rollout"] = PackedPlacementStrategy.from_gpu_range(
+            self._rollout_gpus, self._rollout_num_gpus, self._cluster_num_gpus_per_node
+        )
+        self._placements["actor"] = PackedPlacementStrategy.from_gpu_range(
+            self._actor_gpus, self._actor_num_gpus, self._cluster_num_gpus_per_node
+        )
+
+
+class MathComponentPlacement(ComponentPlacement):
+    """Component placement for Math Experiment."""
+
+    def __init__(self, config: DictConfig):
+        """Initialize MathComponentPlacement
+
+        Args:
+            config (DictConfig): The configuration dictionary for the component placement.
+        """
+        super().__init__(config)
+
+        self._actor_gpus = self._component_gpu_map.get("actor", None)
+        self._inference_gpus = self._component_gpu_map.get("inference", None)
+        self._rollout_gpus = self._component_gpu_map.get("rollout", None)
+        assert self._actor_gpus is not None, (
+            "Actor GPUs must be specified in the component_placement config."
+        )
+        assert self._rollout_gpus is not None, (
+            "Rollout GPUs must be specified in the component_placement config."
+        )
+
+        self._actor_num_gpus = len(self._actor_gpus)
+        self._inference_num_gpus = (
+            len(self._inference_gpus) if self._inference_gpus else 0
+        )
+        self._rollout_num_gpus = len(self._rollout_gpus)
+
+        if self._is_collocated():
+            assert self.actor_tp_size >= self.rollout_tp_size, (
+                f"Actor TP size {self.actor_tp_size} must be greater or equal to Rollout TP size {self.rollout_tp_size}."
+            )
+            self._placement_mode = PlacementMode.COLLOCATED
+            logging.info("Running in collocated mode")
+        elif self._is_disaggregated():
+            assert self.inference_tp_size <= self.inference_world_size, (
+                f"Inference TP size {self.inference_tp_size} must be less than or equal to Inference world size {self.inference_world_size}."
+            )
+            self._placement_mode = PlacementMode.DISAGGREGATED
+            logging.info("Running in disaggregated mode")
+        else:
+            raise ValueError(
+                f"Currently only collocated and disaggregated modes are supported in math. But got {self._component_gpu_map}"
+            )
+
+        # Sanity checking
+        assert self.actor_tp_size <= self.actor_world_size, (
+            f"Actor TP size {self.actor_tp_size} must be less than or equal to Actor world size {self.actor_world_size}."
+        )
+        assert self.rollout_tp_size <= self.rollout_world_size, (
+            f"Rollout TP size {self.rollout_tp_size} must be less than or equal to Rollout world size {self.rollout_world_size}."
+        )
+
+    def _is_collocated(self):
+        if (
+            len(self._actor_gpus) == self._cluster_num_gpus
+            and len(self._rollout_gpus) == self._cluster_num_gpus
+        ):
+            return True
+        return False
+
+    def _is_disaggregated(self):
+        if self._inference_gpus is not None:
+            return (
+                len(self._actor_gpus)
+                + len(self._inference_gpus)
+                + len(self._rollout_gpus)
+                == self._cluster_num_gpus
+            )
+        return False
+
+    def _generate_placements(self):
+        if self._placement_mode == PlacementMode.COLLOCATED:
+            self._placements["actor"] = PackedPlacementStrategy(
+                num_nodes=self._config.cluster.num_nodes
+            )
+
+            actor_tp_size = self._config.actor.model.tensor_model_parallel_size
+            rollout_tp_size = self._config.rollout.tensor_parallel_size
+            assert actor_tp_size >= rollout_tp_size, (
+                f"Actor TP size ({actor_tp_size}) must be greater or equal to Rollout TP size ({rollout_tp_size})"
+            )
+            assert actor_tp_size % rollout_tp_size == 0, (
+                f"Actor TP size ({actor_tp_size}) must be divisible by Rollout TP size ({rollout_tp_size})"
+            )
+            stride = actor_tp_size // rollout_tp_size
+            self._placements["rollout"] = StridedPlacementStrategy(
+                num_nodes=self._config.cluster.num_nodes,
+                num_gpus_per_process=rollout_tp_size,
+                stride=stride,
+            )
+        elif self._placement_mode == PlacementMode.DISAGGREGATED:
+            # Generate continuous placement strategies for components in a cluster.
+            self._placements["rollout"] = PackedPlacementStrategy.from_gpu_range(
+                self._rollout_gpus,
+                self.rollout_dp_size,
+                self._cluster_num_gpus_per_node,
+            )
+            self._placements["inference"] = PackedPlacementStrategy.from_gpu_range(
+                self._inference_gpus,
+                self.inference_world_size,
+                self._cluster_num_gpus_per_node,
+            )
+            self._placements["actor"] = PackedPlacementStrategy.from_gpu_range(
+                self._actor_gpus, self.actor_world_size, self._cluster_num_gpus_per_node
+            )
+
+    @property
+    def actor_dp_size(self) -> int:
+        return self._actor_num_gpus // (
+            self._config.actor.model.tensor_model_parallel_size
+            * self._config.actor.model.context_parallel_size
+            * self._config.actor.model.pipeline_model_parallel_size
+        )
+
+    @property
+    def actor_tp_size(self) -> int:
+        return self._config.actor.model.tensor_model_parallel_size
+
+    @property
+    def actor_pp_size(self) -> int:
+        return self._config.actor.model.pipeline_model_parallel_size
+
+    @property
+    def actor_world_size(self) -> int:
+        return self._actor_num_gpus
+
+    @property
+    def inference_tp_size(self) -> int:
+        if hasattr(self._config.inference.model, "tensor_model_parallel_size"):
+            return self._config.inference.model.tensor_model_parallel_size
+        else:
+            return self.actor_tp_size
+
+    @property
+    def inference_pp_size(self) -> int:
+        if hasattr(self._config.inference.model, "pipeline_model_parallel_size"):
+            return self._config.inference.model.pipeline_model_parallel_size
+        else:
+            return self.actor_pp_size
+
+    @property
+    def inference_dp_size(self) -> int:
+        return self._inference_num_gpus // (
+            self.inference_tp_size * self.inference_pp_size
+        )
+
+    @property
+    def inference_world_size(self) -> int:
+        return self._inference_num_gpus
+
+    @property
+    def rollout_dp_size(self) -> int:
+        return self._rollout_num_gpus // (
+            self._config.rollout.tensor_parallel_size
+            * self._config.rollout.pipeline_parallel_size
+        )
+
+    @property
+    def rollout_tp_size(self) -> int:
+        return self._config.rollout.tensor_parallel_size
+
+    @property
+    def rollout_world_size(self) -> int:
+        return self._rollout_num_gpus

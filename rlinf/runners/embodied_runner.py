@@ -1,0 +1,188 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+
+from omegaconf.dictconfig import DictConfig
+from tqdm import tqdm
+
+from rlinf.algorithms.embodiment.utils import compute_evaluate_metrics
+from rlinf.scheduler import Worker
+from rlinf.utils.distributed import ScopedTimer
+from rlinf.utils.metric_logger import MetricLogger
+from rlinf.utils.runner_utils import check_progress
+
+
+class EmbodiedRunner:
+    def __init__(
+        self,
+        cfg: DictConfig,
+        actor: Worker,
+        rollout: Worker,
+        env: Worker,
+        critic=None,
+        reward=None,
+        run_timer=None,
+    ):
+        self.cfg = cfg
+        self.actor = actor
+        self.rollout = rollout
+        self.env = env
+        self.critic = critic
+        self.reward = reward
+
+        # this timer checks if we should stop training
+        self.run_timer = run_timer
+
+        self.compute_ref_logprobs = self.cfg.algorithm.kl_beta > 0
+        self.recompute_logprobs = self.cfg.rollout.recompute_logprobs
+
+        self.consumed_samples = 0
+        # the step here is GRPO step
+        self.global_step = 0
+
+        # compute `max_steps`
+        self.set_max_steps()
+
+        self.timer = ScopedTimer(reduction="max", sync_cuda=False)
+
+        self.metric_logger = MetricLogger(cfg)
+
+    def init_workers(self):
+        # create worker in order to decrease the maximum memory usage
+        self.actor.init_worker().wait()
+        self.rollout.init_worker().wait()
+        self.env.init_worker().wait()
+
+    def update_rollout_weights(self):
+        rollout_futures = self.rollout.update_weights()
+        actor_futures = self.actor.send_weights()
+        actor_futures.wait()
+        rollout_futures.wait()
+
+    def generate_responses(self):
+        env_futures = self.env.interact()
+        rollout_futures = self.rollout.generate()
+        actor_futures = self.actor.recv_rollout_batch()
+        env_futures.wait()
+        actor_futures.wait()
+        rollout_futures.wait()
+
+    def evaluate(self):
+        env_futures = self.env.evaluate()
+        rollout_futures = self.rollout.evaluate()
+        env_futures.wait()
+        rollout_results = rollout_futures.wait()
+        eval_metrics_list = [
+            results for results in rollout_results if results is not None
+        ]
+        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        return eval_metrics
+
+    def run(self):
+        start_step = self.global_step
+        for _step in tqdm(range(start_step, self.max_steps), ncols=120):
+            if (
+                _step % self.cfg.runner.val_check_interval == 0
+                and self.cfg.runner.val_check_interval > 0
+            ):
+                with self.timer("eval"):
+                    self.update_rollout_weights()
+                    eval_metrics = self.evaluate()
+                    eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                    self.metric_logger.log(data=eval_metrics, step=_step)
+
+            with self.timer("step"):
+                # generate response and compute rule-based rewards.
+                with self.timer("generation"):
+                    # prompts: actor -> rollout
+                    # response ( + rule-based rewards): rollout -> actor
+                    self.update_rollout_weights()
+                    self.generate_responses()
+
+                with self.timer("preprocess_rollout_batch"):
+                    self.actor.preprocess_rollout_batch()
+
+                # recompute rollout policy logprobs, otherwise will use sglang logprobs.
+                if self.recompute_logprobs:
+                    with self.timer("prev_logprobs"):
+                        self.actor.compute_logprobs()
+
+                # compute ref policy logprobs.
+                if self.compute_ref_logprobs:
+                    with self.timer("ref_logprobs"):
+                        self.actor.compute_ref_logprobs()
+
+                with self.timer("cal_response_mask"):
+                    actor_futures = self.actor.compute_loss_mask()
+                    actor_rollout_metrics = actor_futures.wait()
+
+                # compute advantages and returns.
+                with self.timer("cal_adv_and_returns"):
+                    actor_futures = self.actor.compute_advantages_and_returns()
+                    actor_rollout_metrics = actor_futures.wait()
+
+                # actor training.
+                with self.timer("actor_training"):
+                    actor_training_futures = self.actor.run_training()
+                    actor_training_metrics = actor_training_futures.wait()
+
+                self.global_step += 1
+
+                run_val, save_model, is_train_end = check_progress(
+                    self.global_step,
+                    self.max_steps,
+                    self.cfg.runner.val_check_interval,
+                    self.cfg.runner.save_interval,
+                    1.0,
+                    run_time_exceeded=False,
+                )
+
+                if save_model:
+                    self._save_checkpoint()
+
+            time_metrics = self.timer.consume_durations()
+
+            rollout_metrics = {
+                f"rollout/{k}": v for k, v in actor_rollout_metrics[0].items()
+            }
+            time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+            training_metrics = {
+                f"train/{k}": v for k, v in actor_training_metrics[0].items()
+            }
+            self.metric_logger.log(rollout_metrics, _step)
+            self.metric_logger.log(time_metrics, _step)
+            self.metric_logger.log(training_metrics, _step)
+
+        self.metric_logger.finish()
+
+    def _save_checkpoint(self):
+        base_output_dir = os.path.join(
+            self.cfg.runner.logger.log_path,
+            f"checkpoints/global_step_{self.global_step}",
+        )
+        actor_save_path = os.path.join(base_output_dir, "actor")
+        save_futures = self.actor.save_checkpoint(actor_save_path, self.global_step)
+        save_futures.wait()
+
+    def set_max_steps(self):
+        self.num_steps_per_epoch = 1
+        self.max_steps = self.num_steps_per_epoch * self.cfg.runner.max_epochs
+
+        if (max_steps := self.cfg.runner.get("max_steps", -1)) >= 0:
+            self.max_steps = min(self.max_steps, max_steps)
+
+    @property
+    def epoch(self):
+        return self.global_step // self.num_steps_per_epoch

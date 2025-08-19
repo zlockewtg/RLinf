@@ -1,0 +1,14 @@
+__pycache__
+.vscode
+*.log
+*.idx
+*.npy
+*.txt
+!requirements.txt
+*.DS_Store
+*.out
+build
+docs/build
+dist
+logs/*
+*.so
