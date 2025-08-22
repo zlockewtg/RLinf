@@ -23,7 +23,7 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.utils import divide
 from megatron.training.training import unwrap_model
 from megatron.training.utils import average_losses_across_data_parallel_group
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from torch.multiprocessing.reductions import reduce_tensor
 
 from rlinf.algorithms.math.algo_functions import (
@@ -137,15 +137,7 @@ class MegatronActor(MegatronModelManager, Worker):
             assert self.cfg.reward.reward_type == "math", "only support math"
             self.reward_fn = math_verify_call
 
-        # init rollout manager
-        self.recompute_logprobs = self.cfg.rollout.recompute_logprobs
-
         self._rollout_group_name = self.cfg.rollout.group_name
-
-        # sampling parameters for rollout
-        self._sampling_params = OmegaConf.to_container(
-            self.cfg.algorithm.sampling_params, resolve=True
-        )
 
         self._is_data_io_rank = (
             parallel_state.get_tensor_model_parallel_rank() == 0
@@ -340,7 +332,7 @@ class MegatronActor(MegatronModelManager, Worker):
                     ):
                         self.log_warning(
                             f"Current importance ratio {_imp.item():.4f} is larger "
-                            f"than early stop threshold {self.cfg.algorithm.early_stop_imp_ratio}. Abandon this minibatch."
+                            f"than early stop threshold {self.cfg.algorithm.early_stop_imp_ratio}. Abandon this microbatch."
                         )
                         loss = loss * 0.0
                     if self.cfg.algorithm.use_valid_token_scale:
@@ -811,51 +803,6 @@ class MegatronActor(MegatronModelManager, Worker):
 
         return rollout_metrics
 
-    # Reward
-    def _compute_rewards(self, answers: List[str]):
-        all_reward_scores = []
-        texts = []
-        for response, response_len in zip(
-            self.rollout_batches["input_ids"],
-            self.rollout_batches["response_lengths"],
-        ):
-            response = response[
-                self.cfg.data.max_prompt_length : self.cfg.data.max_prompt_length
-                + response_len
-            ]
-            texts.append(
-                self.tokenizer.decode(response.tolist(), skip_special_tokens=True)
-            )
-
-        if torch.distributed.get_rank() == parallel_state.get_model_parallel_src_rank():
-            rewards = self.reward_fn(texts, answers)
-            reward_scores = [
-                self.cfg.reward.reward_scale
-                if reward == 1
-                else -self.cfg.reward.reward_scale
-                for reward in rewards
-            ]
-            all_reward_scores.extend(reward_scores)
-
-        if len(all_reward_scores) > 0:
-            new_all_rewards = []
-
-            for response in all_reward_scores:
-                if response is None:
-                    response = 0.0
-                new_all_rewards.append(response)
-
-            all_reward_scores = torch.as_tensor(
-                new_all_rewards,
-                dtype=torch.float,
-                device=torch.cuda.current_device(),
-            ).view(-1, 1)
-        all_reward_scores = (
-            broadcast_tensor_within_mp(all_reward_scores).flatten().to("cpu")
-        )
-
-        self.rollout_batches.update({"reward_scores": all_reward_scores})
-
     # Rollout
     def _get_rollout_model_state_dict(self):
         """Get the state dictionary of the model for rollout."""
@@ -891,6 +838,10 @@ class MegatronActor(MegatronModelManager, Worker):
         self.log_info(
             f"Actor rank {self._rank} will send weights to {self._weight_dst_rank_in_rollout}"
         )
+
+    def del_reshard_state_dict(self):
+        if hasattr(self, "reshard_state_dict"):
+            del self.reshard_state_dict
 
     def sync_model_to_rollout(self):
         """Send the model weights to the destination ranks in the rollout task."""
@@ -971,9 +922,58 @@ class MegatronActor(MegatronModelManager, Worker):
         )
 
         if not self.cfg.reward.use_reward_model:
-            self._compute_rewards(rollout_result.answers)
+            self.answers = rollout_result.answers
 
         if self.offload_weight:
             self.onload_model_weights_and_grad(load_grad=self.offload_grad)
         if self.offload_optimizer:
             self.onload_megatron_optimizer()
+
+    # Reward
+    def _compute_rewards(self, answers: List[str]):
+        all_reward_scores = []
+        texts = []
+        for response, response_len in zip(
+            self.rollout_batches["input_ids"],
+            self.rollout_batches["response_lengths"],
+        ):
+            response = response[
+                self.cfg.data.max_prompt_length : self.cfg.data.max_prompt_length
+                + response_len
+            ]
+            texts.append(
+                self.tokenizer.decode(response.tolist(), skip_special_tokens=True)
+            )
+
+        if torch.distributed.get_rank() == parallel_state.get_model_parallel_src_rank():
+            rewards = self.reward_fn(texts, answers)
+            reward_scores = [
+                self.cfg.reward.reward_scale
+                if reward == 1
+                else -self.cfg.reward.reward_scale
+                for reward in rewards
+            ]
+            all_reward_scores.extend(reward_scores)
+
+        if len(all_reward_scores) > 0:
+            new_all_rewards = []
+
+            for response in all_reward_scores:
+                if response is None:
+                    response = 0.0
+                new_all_rewards.append(response)
+
+            all_reward_scores = torch.as_tensor(
+                new_all_rewards,
+                dtype=torch.float,
+                device=torch.cuda.current_device(),
+            ).view(-1, 1)
+        all_reward_scores = (
+            broadcast_tensor_within_mp(all_reward_scores).flatten().to("cpu")
+        )
+
+        self.rollout_batches.update({"reward_scores": all_reward_scores})
+
+    def compute_rewards(self):
+        if not self.cfg.reward.use_reward_model:
+            self._compute_rewards(self.answers)

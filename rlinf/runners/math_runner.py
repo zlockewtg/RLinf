@@ -53,6 +53,7 @@ class MathRunner:
         rollout: SGLangWorker,
         inference: MegatronInference,
         actor: MegatronActor,
+        reward=None,
     ):
         """"""
         self.cfg = cfg
@@ -63,6 +64,7 @@ class MathRunner:
         self.actor = actor
         # Collocated mode uses actor as inference
         self.inference = inference if inference is not None else self.actor
+        self.reward = reward if reward is not None else self.actor
 
         # Data channels
         self.dataloader_channel = Channel.create("DataLoader")
@@ -73,7 +75,7 @@ class MathRunner:
 
         # Configurations
         self.compute_ref_logprobs = self.cfg.algorithm.kl_beta > 0
-        self.recompute_logprobs = self.cfg.rollout.recompute_logprobs
+        self.recompute_logprobs = self.cfg.algorithm.recompute_logprobs
         self.consumed_samples = 0
         self.global_steps = 0
 
@@ -277,6 +279,7 @@ class MathRunner:
     def _sync_weights(self):
         self.actor.sync_model_to_rollout()
         self.rollout.sync_model_from_actor().wait()
+        self.actor.del_reshard_state_dict()
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
@@ -308,6 +311,10 @@ class MathRunner:
                         self.inference.process_rollout_result(
                             input_channel=self.rollout_channel
                         ).wait()
+
+                    # compute rewards
+                    with self.timer("cal_rewards"):
+                        self.reward.compute_rewards().wait()
 
                     # recompute rollout policy logprobs, otherwise will use sglang logprobs.
                     if self.recompute_logprobs:
@@ -418,7 +425,7 @@ class MathPipelineRunner:
         self.reward = reward
 
         self.compute_ref_logprobs = self.cfg.algorithm.kl_beta > 0
-        self.recompute_logprobs = self.cfg.rollout.recompute_logprobs
+        self.recompute_logprobs = self.cfg.algorithm.recompute_logprobs
 
         self.consumed_samples = 0
         # the step here is global step
