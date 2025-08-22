@@ -23,7 +23,7 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.utils import divide
 from megatron.training.training import unwrap_model
 from megatron.training.utils import average_losses_across_data_parallel_group
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from torch.multiprocessing.reductions import reduce_tensor
 
 from rlinf.algorithms.math.algo_functions import (

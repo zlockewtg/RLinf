@@ -53,7 +53,7 @@ class MathRunner:
         rollout: SGLangWorker,
         inference: MegatronInference,
         actor: MegatronActor,
-        reward = None,
+        reward=None,
     ):
         """"""
         self.cfg = cfg
