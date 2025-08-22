@@ -78,6 +78,8 @@ class ManiskillEnv(gym.Env):
 
     @property
     def total_num_group_envs(self):
+        if hasattr(self.env.unwrapped, "total_num_trials"):
+            return self.env.unwrapped.total_num_trials
         assert hasattr(self.env, "xyz_configs") and hasattr(self.env, "quat_configs")
         return len(self.env.xyz_configs) * len(self.env.quat_configs)
 

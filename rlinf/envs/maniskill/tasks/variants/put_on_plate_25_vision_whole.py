@@ -19,11 +19,11 @@ from mani_skill.utils.geometry import rotation_conversions
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.pose import Pose
 
-from rlinf.environment.tasks.put_on_in_scene_multi import (
+from rlinf.envs.maniskill.tasks.put_on_in_scene_multi import (
     CARROT_DATASET_DIR,
     PutOnPlateInScene25MainV3,
 )
-from rlinf.environment.tasks.variants.utils import (
+from rlinf.envs.maniskill.tasks.variants.utils import (
     masks_to_boxes_pytorch,
 )
 
@@ -37,6 +37,7 @@ class PutOnPlateInScene25VisionWhole03(PutOnPlateInScene25MainV3):
     select_extra_ids: torch.Tensor
 
     overlay_texture_mix_ratio = 0.3
+    overlay_texture_hw = (960, 1280)
 
     def _prep_init(self):
         # models
@@ -67,7 +68,8 @@ class PutOnPlateInScene25VisionWhole03(PutOnPlateInScene25MainV3):
         texture_fd = CARROT_DATASET_DIR / "more_table" / "textures"
         self.overlay_images_numpy = [
             cv2.resize(
-                cv2.cvtColor(cv2.imread(str(img_fd / k)), cv2.COLOR_BGR2RGB), (640, 480)
+                cv2.cvtColor(cv2.imread(str(img_fd / k)), cv2.COLOR_BGR2RGB),
+                (self.overlay_images_hw[1], self.overlay_images_hw[0]),
             )
             for k in model_db_table  # [H, W, 3]
         ]  # (B) [H, W, 3]
@@ -76,7 +78,7 @@ class PutOnPlateInScene25VisionWhole03(PutOnPlateInScene25MainV3):
                 cv2.cvtColor(
                     cv2.imread(str(texture_fd / v["texture"])), cv2.COLOR_BGR2RGB
                 ),
-                (1280, 960),
+                (self.overlay_texture_hw[1], self.overlay_texture_hw[0]),
             )
             for v in model_db_table.values()  # [H, W, 3]
         ]  # (B) [H, W, 3]
@@ -296,7 +298,7 @@ class PutOnPlateInScene25VisionWhole03(PutOnPlateInScene25MainV3):
         self.plate_bbox_world = p_rotated_bbox_size  # [b, 3]
 
         # stats to track
-        self._reset_stats(env_idx, c_rotated_bbox_size, p_rotated_bbox_size)
+        self._reset_stats(env_idx)
 
     def _green_sceen_rgb(
         self, rgb, segmentation, overlay_img, overlay_texture, overlay_mix
@@ -313,7 +315,10 @@ class PutOnPlateInScene25VisionWhole03(PutOnPlateInScene25MainV3):
             )
 
         robot_item_ids = torch.concat(
-            [self.robot_link_ids, self.target_object_actor_ids]
+            [
+                self.robot_link_ids,
+                self.target_object_actor_ids,
+            ]
         )
         arm_obj_mask = torch.isin(actor_seg, robot_item_ids)  # [b, H, W]
 

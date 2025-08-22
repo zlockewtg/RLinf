@@ -15,41 +15,14 @@
 import io
 
 import torch
-from mani_skill.envs.utils.randomization.batched_rng import BatchedRNG
 
-from rlinf.envs.maniskill_env import ManiskillEnv as BaseManiskillEnv
-
-
-def recursive_to_device(obj, device):
-    if isinstance(obj, torch.Tensor):
-        return obj.to(device)
-    elif isinstance(obj, list):
-        return [recursive_to_device(elem, device) for elem in obj]
-    elif isinstance(obj, tuple):
-        return tuple(recursive_to_device(elem, device) for elem in obj)
-    elif isinstance(obj, dict):
-        return {k: recursive_to_device(v, device) for k, v in obj.items()}
-    else:
-        return obj
-
-
-def get_batch_rng_state(batched_rng):
-    state = {
-        "rngs": batched_rng.rngs,
-    }
-    return state
-
-
-def set_batch_rng_state(state: dict):
-    return BatchedRNG.from_rngs(state["rngs"])
-
-
-class EnvOffloadMixin:
-    def get_state(self) -> bytes:
-        pass
-
-    def load_state(self, state: bytes):
-        pass
+from rlinf.envs.maniskill.maniskill_env import ManiskillEnv as BaseManiskillEnv
+from rlinf.envs.offload_wrapper.base import (
+    EnvOffloadMixin,
+    get_batch_rng_state,
+    recursive_to_device,
+    set_batch_rng_state,
+)
 
 
 class ManiskillEnv(BaseManiskillEnv, EnvOffloadMixin):
@@ -211,3 +184,6 @@ class ManiskillEnv(BaseManiskillEnv, EnvOffloadMixin):
             self.success_once = state["success_once"].to(self.device)
             self.fail_once = state["fail_once"].to(self.device)
             self.returns = state["returns"].to(self.device)
+
+
+__all__ = ["ManiskillEnv"]

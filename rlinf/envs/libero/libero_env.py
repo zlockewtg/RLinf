@@ -24,7 +24,7 @@ from libero.libero.benchmark import Benchmark, get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 from omegaconf.omegaconf import OmegaConf
 
-from rlinf.envs.libero_utils.utils import (
+from rlinf.envs.libero.utils import (
     get_libero_image,
     get_libero_wrist_image,
     list_of_dict_to_dict_of_list,
@@ -34,7 +34,7 @@ from rlinf.envs.libero_utils.utils import (
     tile_images,
     to_tensor,
 )
-from rlinf.envs.libero_utils.venv import ReconfigureSubprocEnv
+from rlinf.envs.libero.venv import ReconfigureSubprocEnv
 
 
 class LiberoEnv(gym.Env):
@@ -105,7 +105,11 @@ class LiberoEnv(gym.Env):
                 get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
             )
             env_fn_params.append(
-                {**base_env_args, "bddl_file_name": task_bddl_file, "seed": self.seed}
+                {
+                    **base_env_args,
+                    "bddl_file_name": task_bddl_file,
+                    "seed": self.seed,
+                }
             )
             task_descriptions.append(task.language)
         self.task_descriptions = task_descriptions
@@ -121,7 +125,10 @@ class LiberoEnv(gym.Env):
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
 
     def update_reset_state_ids(self):
-        reset_state_ids = self._get_random_reset_state_ids(self.num_group)
+        if self.cfg.only_eval:
+            reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
+        else:
+            reset_state_ids = self._get_random_reset_state_ids(self.num_group)
         self.reset_state_ids = reset_state_ids.repeat(self.group_size)
 
     def _init_task_and_trial_ids(self):
@@ -132,6 +139,13 @@ class LiberoEnv(gym.Env):
     def _get_random_reset_state_ids(self, num_reset_states):
         reset_state_ids = self._generator.integers(
             low=0, high=self.total_num_group_envs, size=(num_reset_states,)
+        )
+        return reset_state_ids
+
+    def _get_ordered_reset_state_ids(self, num_reset_states):
+        start_idx = self.rank * num_reset_states
+        reset_state_ids = torch.tensor(
+            list(range(start_idx, start_idx + num_reset_states)), dtype=torch.int32
         )
         return reset_state_ids
 

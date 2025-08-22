@@ -5,8 +5,9 @@ use_rel_reward: True
 seed: 0
 num_group: ${env.eval.num_envs}
 group_size: 1
+policy_setup: "windwox_bridge"
 use_fixed_reset_state_ids: True
-num_envs: 32
+num_envs: 16
 only_eval: True
 
 video_cfg:
@@ -15,7 +16,7 @@ video_cfg:
   video_base_dir: ${runner.logger.log_path}/video/eval
 
 init_params:
-  id: "PutCarrotOnPlateInScene-v1"
+  id: null
   num_envs: ${env.eval.num_envs}
   obs_mode: ${env.train.init_params.obs_mode}
   control_mode: None
@@ -23,4 +24,5 @@ init_params:
   sim_config: ${env.train.init_params.sim_config}
   max_episode_steps: ${env.train.init_params.max_episode_steps}
   sensor_configs: ${env.train.init_params.sensor_configs}
-  render_mode: null
+  render_mode: sensors
+  obj_set: test

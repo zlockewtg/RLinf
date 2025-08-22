@@ -14,7 +14,7 @@
 
 from mani_skill.utils.registration import register_env
 
-from rlinf.environment.tasks.put_on_in_scene_multi import (
+from rlinf.envs.maniskill.tasks.put_on_in_scene_multi import (
     PutOnPlateInScene25MainV3,
 )
 
@@ -71,6 +71,7 @@ class PutOnPlateInScene25Carrot(PutOnPlateInScene25MainV3):
         lo = 16
         lo_offset = 0
         lp = len(self.plate_names)
+        lp_offset = 0
         l1 = len(self.xyz_configs)
         l2 = len(self.quat_configs)
-        return lc, lc_offset, lo, lo_offset, lp, l1, l2
+        return lc, lc_offset, lo, lo_offset, lp, lp_offset, l1, l2
