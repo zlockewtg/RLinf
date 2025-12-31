@@ -17,3 +17,20 @@ outputs/*
 .venv
 uv.lock
 rlinf/envs/maniskill/assets
+# model weights / large files
+storage/download_models/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+
+# python env
+.venv/
+venv/
+__pycache__/
+
+# caches
+*.log
+*.tmp
