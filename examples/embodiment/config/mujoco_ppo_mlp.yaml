@@ -106,9 +106,9 @@ env:
 
     use_rel_reward: true
     reward_coef: 1.0
-    is_eval: false
+    is_eval: true
     video_cfg:
-      save_video: false
+      save_video: true
       info_on_video: true
       video_base_dir: ${runner.logger.log_path}/video/train
   eval:

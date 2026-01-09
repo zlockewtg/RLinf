@@ -1,18 +1,36 @@
-import os
-import copy
-from typing import Any, Dict, List, Optional, Union
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+
+import copy
+import os
+from typing import Any, Optional, Union
+
+import gym
 import numpy as np
 import torch
-import gym
 
-from rlinf.envs.utils import put_info_on_image, save_rollout_video, tile_images
+from rlinf.envs import utils as rlinf_utils
+
+__all__ = ["SERLFrankaEnv"]
 
 
 # ==========================================================
-# Obs utils
+# Obs utils: object scalar unwrap + robust flatten
 # ==========================================================
-def _unwrap_object_scalar(x, max_unwrap: int = 10):
+def _unwrap_object_scalar(x: Any, max_unwrap: int = 10) -> Any:
+    """Unwrap numpy object scalar (shape=(), dtype=object) safely."""
     cur = x
     for _ in range(max_unwrap):
         arr = np.asarray(cur)
@@ -26,11 +44,17 @@ def _unwrap_object_scalar(x, max_unwrap: int = 10):
     return cur
 
 
-def _flatten_any_safe(x, visited=None, depth=0, max_depth=20) -> np.ndarray:
+def _flatten_any_safe(
+    x: Any,
+    visited: Optional[set[int]] = None,
+    depth: int = 0,
+    max_depth: int = 20,
+) -> np.ndarray:
+    """Flatten nested dict/list/tuple/object-arr into 1D float32 array."""
     if visited is None:
         visited = set()
     if depth > max_depth:
-        raise RuntimeError("flatten exceeded max_depth; obs too deep/cyclic")
+        raise RuntimeError("Observation flatten exceeded max_depth; obs may be cyclic.")
 
     obj_id = id(x)
     if obj_id in visited:
@@ -38,32 +62,36 @@ def _flatten_any_safe(x, visited=None, depth=0, max_depth=20) -> np.ndarray:
     visited.add(obj_id)
 
     if isinstance(x, dict):
-        return np.concatenate(
-            [_flatten_any_safe(x[k], visited, depth + 1, max_depth) for k in sorted(x.keys())],
-            axis=0,
-        ) if x else np.zeros((0,), dtype=np.float32)
+        parts = [
+            _flatten_any_safe(x[k], visited, depth + 1, max_depth)
+            for k in sorted(x.keys())
+        ]
+        return np.concatenate(parts, axis=0) if parts else np.zeros((0,), np.float32)
 
     if isinstance(x, (list, tuple)):
-        return np.concatenate(
-            [_flatten_any_safe(v, visited, depth + 1, max_depth) for v in x],
-            axis=0,
-        ) if x else np.zeros((0,), dtype=np.float32)
+        parts = [_flatten_any_safe(v, visited, depth + 1, max_depth) for v in x]
+        return np.concatenate(parts, axis=0) if parts else np.zeros((0,), np.float32)
 
     arr = np.asarray(x)
+
     if arr.dtype == object and arr.shape == ():
         y = _unwrap_object_scalar(x)
-        return _flatten_any_safe(y, visited, depth + 1, max_depth) if id(y) != id(x) else np.zeros((0,), np.float32)
+        if id(y) == id(x):
+            return np.zeros((0,), np.float32)
+        return _flatten_any_safe(y, visited, depth + 1, max_depth)
 
     if arr.dtype == object:
-        return np.concatenate(
-            [_flatten_any_safe(v, visited, depth + 1, max_depth) for v in arr.ravel().tolist()],
-            axis=0,
-        ) if arr.size else np.zeros((0,), np.float32)
+        parts = [
+            _flatten_any_safe(v, visited, depth + 1, max_depth)
+            for v in arr.ravel().tolist()
+        ]
+        return np.concatenate(parts, axis=0) if parts else np.zeros((0,), np.float32)
 
     return arr.astype(np.float32, copy=False).reshape(-1)
 
 
-def extract_serl_state(raw_obs, state_key="states") -> np.ndarray:
+def extract_serl_state(raw_obs: Any, state_key: str = "states") -> np.ndarray:
+    """Extract and flatten SERL state."""
     if isinstance(raw_obs, tuple) and len(raw_obs) == 2:
         raw_obs = raw_obs[0]
     if isinstance(raw_obs, dict):
@@ -72,22 +100,25 @@ def extract_serl_state(raw_obs, state_key="states") -> np.ndarray:
     return _flatten_any_safe(raw_obs)
 
 
-def extract_serl_images_dict(raw_obs, image_key="images") -> Dict[str, np.ndarray]:
+def extract_serl_images_dict(
+    raw_obs: Any,
+    image_key: str = "images",
+) -> dict[str, np.ndarray]:
+    """Extract SERL images dict from raw obs."""
     if isinstance(raw_obs, tuple) and len(raw_obs) == 2:
         raw_obs = raw_obs[0]
-    assert isinstance(raw_obs, dict), f"Expected dict obs, got {type(raw_obs)}"
+    if not isinstance(raw_obs, dict):
+        raise TypeError(f"Expected dict obs, got {type(raw_obs)}.")
 
-    images_dict = _unwrap_object_scalar(raw_obs[image_key])
+    images_obj = raw_obs[image_key]
+    images_dict = _unwrap_object_scalar(images_obj)
     if not isinstance(images_dict, dict):
-        raise TypeError(f"Expected images_dict to be dict, got {type(images_dict)}")
-
+        raise TypeError(f"Expected images_dict to be dict, got {type(images_dict)}.")
     return {k: np.asarray(v, dtype=np.uint8) for k, v in images_dict.items()}
 
 
-# ==========================================================
-# Generic helpers
-# ==========================================================
-def _cfg_get(cfg, key: str, default=None):
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    """Fetch cfg value for dict/attr config."""
     if cfg is None:
         return default
     if isinstance(cfg, dict):
@@ -95,254 +126,271 @@ def _cfg_get(cfg, key: str, default=None):
     return getattr(cfg, key, default)
 
 
-def torch_clone(x):
+def _torch_clone_dict(x: Any) -> Any:
+    """Clone nested tensor structures, deepcopy non-tensors."""
     if isinstance(x, torch.Tensor):
         return x.clone()
     if isinstance(x, dict):
-        return {k: torch_clone(v) for k, v in x.items()}
+        return {k: _torch_clone_dict(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
-        return [torch_clone(v) for v in x]
+        return [_torch_clone_dict(v) for v in x]
     return copy.deepcopy(x)
 
 
-def _to_scalar(v):
-    if isinstance(v, np.ndarray) and v.shape == ():
-        return v.item()
-    if isinstance(v, torch.Tensor) and v.numel() == 1:
-        return v.item()
-    return v
-
-
 # ==========================================================
-# SERLFrankaEnv
+# SERLFrankaEnv (Maniskill-style)
 # ==========================================================
 class SERLFrankaEnv(gym.Env):
+    """SERL Franka wrapper aligned with ManiSkill env wrapper style."""
+
     metadata = {"render_modes": []}
 
-    def __init__(self, cfg, num_envs: int, seed_offset: int, total_num_processes: int, worker_info=None, record_metrics=True):
+    def __init__(
+        self,
+        cfg: Any,
+        num_envs: int,
+        seed_offset: int,
+        total_num_processes: int,
+        worker_info: Any,
+        record_metrics: bool = True,
+    ):
+        """Initialize SERL wrapper.
+
+        Args:
+          cfg: Config object/dict.
+          num_envs: Number of parallel envs (manual list of gym envs).
+          seed_offset: Seed offset added to cfg.seed.
+          total_num_processes: Total num processes for interface parity.
+          worker_info: Worker metadata.
+          record_metrics: Whether to record episode metrics.
+        """
         super().__init__()
-        self.cfg = cfg
-        self.seed = int(_cfg_get(cfg, "seed", 0)) + int(seed_offset)
+        env_seed = int(_cfg_get(cfg, "seed", 0))
+        self.seed = env_seed + int(seed_offset)
+
         self.total_num_processes = int(total_num_processes)
         self.worker_info = worker_info
+        self.cfg = cfg
 
-        # basic flags
         self.auto_reset = bool(_cfg_get(cfg, "auto_reset", True))
         self.use_rel_reward = bool(_cfg_get(cfg, "use_rel_reward", False))
         self.ignore_terminations = bool(_cfg_get(cfg, "ignore_terminations", False))
 
-        # group (compat only)
+        self.num_group = int(num_envs) // int(_cfg_get(cfg, "group_size", 1))
         self.group_size = int(_cfg_get(cfg, "group_size", 1))
-        self.num_group = int(num_envs) // max(self.group_size, 1)
-        self.use_fixed_reset_state_ids = bool(_cfg_get(cfg, "use_fixed_reset_state_ids", False))
+        self.use_fixed_reset_state_ids = bool(
+            _cfg_get(cfg, "use_fixed_reset_state_ids", False)
+        )
 
-        # obs config
-        wrap_obs_mode = _cfg_get(cfg, "wrap_obs_mode", None)
-        if wrap_obs_mode is None:
-            wrap_obs_mode = "openvla" if str(_cfg_get(cfg, "obs_format", "openvla")).lower() == "openvla" else "simple"
-        self.wrap_obs_mode = str(wrap_obs_mode).lower()
-
-        obs_mode = str(_cfg_get(cfg, "obs_mode", "state")).lower()
-        self.obs_mode = "rgb" if obs_mode in ("rgb", "image", "vision") else "state"
-
-        self.state_key = _cfg_get(cfg, "state_key", "states")
-        self.image_key = _cfg_get(cfg, "image_key", "images")
-        self.main_camera = _cfg_get(cfg, "main_camera", _cfg_get(cfg, "camera", "front"))
-        self.extra_camera = _cfg_get(cfg, "extra_camera", "wrist")
-        self.use_wrist_as_extra_view = bool(_cfg_get(cfg, "use_wrist_as_extra_view", True))
-
-        self.task_prompt = _cfg_get(cfg, "task_prompt", "Pick up the cube.")
-        self.record_metrics = bool(record_metrics)
-
-        # device
-        self._device = torch.device(str(_cfg_get(cfg, "device", "cpu")))
-        if self._device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"cfg.device={self._device} but CUDA not available")
-
-        # video config
         self.video_cfg = _cfg_get(cfg, "video_cfg", None)
         self.video_cnt = 0
-        self.render_images: List[np.ndarray] = []
+        self.render_images: list[np.ndarray] = []
 
-        # Mujoco backend
-        if self.obs_mode == "rgb":
-            os.environ.setdefault("MUJOCO_GL", str(_cfg_get(cfg, "mujoco_gl", "egl")))
-            os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-            os.environ.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
-        else:
-            os.environ.setdefault("MUJOCO_GL", str(_cfg_get(cfg, "mujoco_gl", "disable")))
-            self.video_cfg = None
+        self.wrap_obs_mode = str(
+            _cfg_get(cfg, "wrap_obs_mode", _cfg_get(cfg, "obs_format", "openvla"))
+        ).lower()
+        self.obs_mode = str(_cfg_get(cfg, "obs_mode", "state")).lower()
+        self.obs_mode = (
+            "rgb" if self.obs_mode in ("rgb", "image", "vision") else "state"
+        )
 
-        # build envs
-        self.env_id = _cfg_get(cfg, "gym_id", "PandaPickCube-v0")
-        self._num_envs = int(num_envs)
-        self.envs = [self._make_env(i) for i in range(self._num_envs)]
+        self.state_key = str(_cfg_get(cfg, "state_key", "states"))
+        self.image_key = str(_cfg_get(cfg, "image_key", "images"))
+
+        self.main_camera = str(
+            _cfg_get(cfg, "main_camera", _cfg_get(cfg, "camera", "front"))
+        )
+        self.extra_camera = str(_cfg_get(cfg, "extra_camera", "wrist"))
+        self.use_wrist_as_extra_view = bool(
+            _cfg_get(cfg, "use_wrist_as_extra_view", True)
+        )
+
+        self.task_prompt = str(_cfg_get(cfg, "task_prompt", "Pick up the cube."))
+
+        dev_str = str(_cfg_get(cfg, "device", "cpu"))
+        self._device = torch.device(dev_str)
+        if self._device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"cfg.device={dev_str} but CUDA is not available.")
+
+        self._configure_mujoco()
+
+        self.env_id = str(_cfg_get(cfg, "gym_id", "PandaPickCube-v0"))
+        self.envs = [self._make_env(i) for i in range(int(num_envs))]
 
         self.single_action_space = self.envs[0].action_space
         self.action_space = self.single_action_space
 
-        # infer obs space
-        raw0, _ = self._gym_reset(self.envs[0], seed=self.seed)
+        raw0, _ = self.envs[0].reset(seed=self.seed)
         self._state_dim = int(extract_serl_state(raw0, self.state_key).shape[0])
         self._init_observation_space(raw0)
 
-        # tracking
-        self.prev_step_reward = torch.zeros(self._num_envs, device=self.device)
-        self._elapsed_steps = torch.zeros(self._num_envs, dtype=torch.int32, device=self.device)
-        self._needs_reset = torch.zeros(self._num_envs, dtype=torch.bool, device=self.device)
+        # Maniskill-style metrics fields.
+        self.prev_step_reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
+            self.device
+        )
+        self.record_metrics = bool(record_metrics)
         self._is_start = True
+        self._elapsed_steps = torch.zeros(
+            self.num_envs, dtype=torch.int32, device=self.device
+        )
+        self._needs_reset = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
 
+        self._init_reset_state_ids()
+        self.info_logging_keys = ["success", "fail"]
         if self.record_metrics:
             self._init_metrics()
 
-        self._last_obs = None
-        self._last_info = {}
+        self._last_obs: Optional[dict[str, Any]] = None
+        self._last_info: dict[str, Any] = {}
 
-        self._init_reset_state_ids()
-
-    # -------------------- basic properties --------------------
+    # -------------------- properties (match ManiSkill wrapper) --------------------
     @property
-    def num_envs(self):
-        return self._num_envs
+    def total_num_group_envs(self) -> int:
+        return np.iinfo(np.uint8).max // 2
 
     @property
-    def device(self):
+    def num_envs(self) -> int:
+        return len(self.envs)
+
+    @property
+    def device(self) -> torch.device:
         return self._device
 
     @property
-    def elapsed_steps(self):
+    def elapsed_steps(self) -> torch.Tensor:
         return self._elapsed_steps
 
     @property
-    def is_start(self):
+    def is_start(self) -> bool:
         return self._is_start
 
     @is_start.setter
-    def is_start(self, value):
+    def is_start(self, value: bool) -> None:
         self._is_start = bool(value)
 
     @property
-    def instruction(self):
-        return [str(self.task_prompt)] * self.num_envs
-
-    @property
-    def total_num_group_envs(self):
-        return np.iinfo(np.uint8).max // 2
+    def instruction(self) -> list[str]:
+        return [self.task_prompt] * self.num_envs
 
     # -------------------- init helpers --------------------
-    def _make_env(self, i: int):
+    def _configure_mujoco(self) -> None:
+        if self.obs_mode == "rgb":
+            os.environ.setdefault(
+                "MUJOCO_GL", str(_cfg_get(self.cfg, "mujoco_gl", "egl"))
+            )
+            os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+            os.environ.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
+        else:
+            os.environ.setdefault(
+                "MUJOCO_GL", str(_cfg_get(self.cfg, "mujoco_gl", "disable"))
+            )
+            self.video_cfg = None
+
+    def _make_env(self, env_idx: int) -> gym.Env:
         kwargs = {}
         if self.obs_mode == "rgb":
-            kwargs.update(image_obs=True, render_mode="rgb_array")
-        e = gym.make(self.env_id, disable_env_checker=True, **kwargs)
+            kwargs["image_obs"] = True
+            kwargs["render_mode"] = "rgb_array"
+        env = gym.make(self.env_id, disable_env_checker=True, **kwargs)
         try:
-            e.reset(seed=self.seed + i)
+            env.reset(seed=self.seed + env_idx)
         except Exception:
             pass
-        return e
+        return env
 
-    def _gym_reset(self, env, seed=None, options=None):
-        try:
-            return env.reset(seed=seed, options=options)
-        except TypeError:
-            out = env.reset(seed=seed)
-            return out if isinstance(out, tuple) else (out, {})
-        except Exception:
-            out = env.reset()
-            return out if isinstance(out, tuple) else (out, {})
-
-    def _init_observation_space(self, raw0):
+    def _init_observation_space(self, raw0: Any) -> None:
         if self.obs_mode != "rgb":
             self.observation_space = gym.spaces.Dict(
-                {"states": gym.spaces.Box(-np.inf, np.inf, shape=(self._num_envs, self._state_dim), dtype=np.float32)}
+                {
+                    "states": gym.spaces.Box(
+                        low=-np.inf,
+                        high=np.inf,
+                        shape=(self.num_envs, self._state_dim),
+                        dtype=np.float32,
+                    ),
+                }
             )
             return
 
         imgs = extract_serl_images_dict(raw0, self.image_key)
         main = imgs.get(self.main_camera, imgs[sorted(imgs.keys())[0]])
         h, w, c = main.shape
-
         spaces = {
-            "main_images": gym.spaces.Box(0, 255, shape=(self._num_envs, h, w, c), dtype=np.uint8),
-            "states": gym.spaces.Box(-np.inf, np.inf, shape=(self._num_envs, self._state_dim), dtype=np.float32),
+            "main_images": gym.spaces.Box(
+                0, 255, shape=(self.num_envs, h, w, c), dtype=np.uint8
+            ),
+            "states": gym.spaces.Box(
+                -np.inf,
+                np.inf,
+                shape=(self.num_envs, self._state_dim),
+                dtype=np.float32,
+            ),
         }
         if self.use_wrist_as_extra_view:
-            spaces["extra_view_images"] = gym.spaces.Box(0, 255, shape=(self._num_envs, 1, h, w, c), dtype=np.uint8)
-
+            spaces["extra_view_images"] = gym.spaces.Box(
+                0, 255, shape=(self.num_envs, 1, h, w, c), dtype=np.uint8
+            )
         self.observation_space = gym.spaces.Dict(spaces)
 
-    # -------------------- metrics --------------------
-    def _init_metrics(self):
-        self.success_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.fail_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.returns = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+    # -------------------- reset-state ids (compat only) --------------------
+    def _init_reset_state_ids(self) -> None:
+        self.reset_state_ids = None
 
-    def _reset_metrics(self, idx: Optional[torch.Tensor] = None):
-        if idx is None:
-            idx = torch.arange(self.num_envs, device=self.device)
-        self.prev_step_reward[idx] = 0.0
-        self._elapsed_steps[idx] = 0
-        if self.record_metrics:
-            self.success_once[idx] = False
-            self.fail_once[idx] = False
-            self.returns[idx] = 0.0
+    def update_reset_state_ids(self) -> None:
+        return
 
-    def _record_metrics(self, step_reward: torch.Tensor, infos: Dict[str, Any]):
-        if not self.record_metrics:
-            return infos
-        self.returns += step_reward
-        ep = {
-            "return": self.returns.clone(),
-            "episode_len": self.elapsed_steps.clone(),
+    # -------------------- obs wrap (match ManiSkill style) --------------------
+    def _wrap_obs(self, raw_obs: Any) -> dict[str, Any]:
+        if self.obs_mode == "state":
+            state_np = extract_serl_state(raw_obs, self.state_key)
+            state = torch.from_numpy(state_np).to(self.device)
+            if self.wrap_obs_mode == "simple":
+                return {"states": state}
+            return {"states": state, "task_descriptions": self.task_prompt}
+
+        state_np = extract_serl_state(raw_obs, self.state_key)
+        state = torch.from_numpy(state_np).to(self.device)
+
+        main_np, extra_np = self._pick_images(raw_obs)
+        main = torch.from_numpy(np.ascontiguousarray(main_np, np.uint8)).to(self.device)
+        extra = torch.from_numpy(np.ascontiguousarray(extra_np, np.uint8)).to(
+            self.device
+        )
+        extra_view = extra.unsqueeze(0) if self.use_wrist_as_extra_view else None
+
+        if self.wrap_obs_mode == "simple":
+            return {
+                "main_images": main,
+                "extra_view_images": extra_view,
+                "states": state,
+            }
+        if self.wrap_obs_mode == "openpi":
+            return {
+                "main_images": main,
+                "wrist_images": extra,
+                "extra_view_images": extra_view,
+                "states": state,
+                "task_descriptions": self.task_prompt,
+            }
+        # default openvla
+        return {
+            "main_images": main,
+            "extra_view_images": extra_view,
+            "states": state,
+            "task_descriptions": self.task_prompt,
         }
-        denom = torch.clamp(ep["episode_len"].float(), min=1.0)
-        ep["reward"] = ep["return"] / denom
 
-        if "success" in infos:
-            self.success_once |= infos["success"].bool()
-            ep["success_once"] = self.success_once.clone()
-
-        if "fail" in infos:
-            self.fail_once |= infos["fail"].bool()
-            ep["fail_once"] = self.fail_once.clone()
-
-        infos["episode"] = ep
-        return infos
-
-    # -------------------- obs wrapping --------------------
-    def _pick_images(self, raw_obs):
+    def _pick_images(self, raw_obs: dict) -> tuple[np.ndarray, np.ndarray]:
         images = extract_serl_images_dict(raw_obs, self.image_key)
         keys = sorted(images.keys())
         main = images.get(self.main_camera, images[keys[0]])
         extra = images.get(self.extra_camera, main)
         return main, extra
 
-    def _wrap_obs_one(self, raw_obs) -> Dict[str, Any]:
-        state = torch.from_numpy(extract_serl_state(raw_obs, self.state_key)).to(self.device)
-
-        if self.obs_mode == "state":
-            out = {"states": state}
-            if self.wrap_obs_mode != "simple":
-                out["task_descriptions"] = str(self.task_prompt)
-            return out
-
-        main_np, extra_np = self._pick_images(raw_obs)
-        main = torch.from_numpy(np.ascontiguousarray(main_np, np.uint8)).to(self.device)
-        extra = torch.from_numpy(np.ascontiguousarray(extra_np, np.uint8)).to(self.device).unsqueeze(0)
-
-        if self.wrap_obs_mode == "simple":
-            return {"main_images": main, "extra_view_images": extra if self.use_wrist_as_extra_view else None, "states": state}
-
-        if self.wrap_obs_mode == "openvla":
-            return {"main_images": main, "extra_view_images": extra if self.use_wrist_as_extra_view else None, "states": state, "task_descriptions": str(self.task_prompt)}
-
-        if self.wrap_obs_mode == "openpi":
-            return {"main_images": main, "wrist_images": extra.squeeze(0), "extra_view_images": extra if self.use_wrist_as_extra_view else None, "states": state, "task_descriptions": str(self.task_prompt)}
-
-        raise ValueError(f"Unknown wrap_obs_mode: {self.wrap_obs_mode}")
-
-    def _collate_obs(self, obs_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
+    def _collate_obs(self, obs_list: list[dict[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
         keys = set().union(*[o.keys() for o in obs_list])
 
         for k in sorted(keys):
@@ -354,259 +402,356 @@ class SERLFrankaEnv(gym.Env):
             else:
                 out[k] = vals
 
-        # pad states to max
+        # pad states to max dim
         states = [o["states"].view(-1) for o in obs_list]
-        max_d = max(s.numel() for s in states)
-        padded = torch.zeros((len(states), max_d), device=self.device)
+        max_d = max((s.numel() for s in states), default=0)
+        padded = torch.zeros(
+            (len(states), max_d), dtype=torch.float32, device=self.device
+        )
         for i, s in enumerate(states):
             padded[i, : s.numel()] = s
         out["states"] = padded
         return out
 
-    def _collate_infos(self, infos: List[dict]) -> Dict[str, Any]:
-        keys = set().union(*[inf.keys() for inf in infos if isinstance(inf, dict)])
-        out: Dict[str, Any] = {}
+    def _collate_infos(self, info_list: list[dict]) -> dict[str, Any]:
+        keys = set().union(*[inf.keys() for inf in info_list if isinstance(inf, dict)])
+        out: dict[str, Any] = {}
         for k in sorted(keys):
-            vals = [_to_scalar(inf.get(k, None)) for inf in infos]
+            vals = [inf.get(k, None) for inf in info_list]
             is_bool = all(isinstance(v, (bool, np.bool_)) or v is None for v in vals)
-            is_num = all(isinstance(v, (int, float, np.number)) or v is None for v in vals)
-
+            is_num = all(
+                isinstance(v, (int, float, np.number)) or v is None for v in vals
+            )
             if is_bool:
-                out[k] = torch.tensor([bool(v) if v is not None else False for v in vals], device=self.device, dtype=torch.bool)
+                out[k] = torch.tensor(
+                    [bool(v) if v is not None else False for v in vals],
+                    device=self.device,
+                    dtype=torch.bool,
+                )
             elif is_num:
-                out[k] = torch.tensor([float(v) if v is not None else 0.0 for v in vals], device=self.device, dtype=torch.float32)
+                out[k] = torch.tensor(
+                    [float(v) if v is not None else 0.0 for v in vals],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
             else:
                 out[k] = vals
-
-        # normalize success/fail
-        if "success" not in out and "is_success" in out:
-            out["success"] = out["is_success"].bool()
-        if "success" in out and isinstance(out["success"], torch.Tensor) and out["success"].dtype != torch.bool:
-            out["success"] = out["success"] > 0.5
-        if "fail" in out and isinstance(out["fail"], torch.Tensor) and out["fail"].dtype != torch.bool:
-            out["fail"] = out["fail"] > 0.5
-
         return out
 
-    # -------------------- video --------------------
-    def add_new_frames(self, obs: Dict[str, Any], plot_infos: Dict[str, Any]):
-        if "main_images" not in obs:
-            return
-        imgs = obs["main_images"].detach().cpu().numpy()
-        images = []
-        for env_id in range(imgs.shape[0]):
-            info_item = {}
-            for k, v in plot_infos.items():
-                if isinstance(v, torch.Tensor):
-                    v = v.detach().cpu().numpy()
-                info_item[k] = v[env_id] if isinstance(v, (list, np.ndarray)) and np.size(v) > 1 else v
-            img = imgs[env_id]
-            if getattr(self.video_cfg, "info_on_video", False):
-                img = put_info_on_image(img, info_item)
-            images.append(img)
-        full_image = tile_images(images, nrows=int(np.sqrt(self.num_envs)))
-        self.render_images.append(full_image)
+    # -------------------- reward / metrics (match ManiSkill style) --------------------
+    def _calc_step_reward(self, reward: torch.Tensor) -> torch.Tensor:
+        reward_diff = reward - self.prev_step_reward
+        self.prev_step_reward = reward
+        return reward_diff if self.use_rel_reward else reward
 
-    def flush_video(self, sub_dir=None):
-        if not (self.video_cfg and getattr(self.video_cfg, "save_video", False)):
-            return
-        output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
-        if sub_dir:
-            output_dir = os.path.join(output_dir, sub_dir)
-        save_rollout_video(self.render_images, output_dir=output_dir, video_name=str(self.video_cnt))
-        self.video_cnt += 1
-        self.render_images = []
+    def _init_metrics(self) -> None:
+        self.success_once = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.fail_once = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.returns = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float32
+        )
 
-    # ==========================================================
-    # RLinf API
-    # ==========================================================
-    def reset(self, *, seed: Optional[Union[int, List[int]]] = None, options: Optional[dict] = None):
-        env_idx = None if options is None else options.get("env_idx", None)
-        reset_options = {} if options is None else {k: v for k, v in options.items() if k != "env_idx"}
-
+    def _reset_metrics(self, env_idx: Optional[torch.Tensor] = None) -> None:
         if env_idx is not None:
-            env_idx = torch.as_tensor(env_idx, dtype=torch.int64, device=self.device)
-            if self._last_obs is None:
-                env_idx = None
+            mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            mask[env_idx] = True
+            self.prev_step_reward[mask] = 0.0
+            self._elapsed_steps[mask] = 0
+            if self.record_metrics:
+                self.success_once[mask] = False
+                self.fail_once[mask] = False
+                self.returns[mask] = 0.0
+        else:
+            self.prev_step_reward[:] = 0.0
+            self._elapsed_steps[:] = 0
+            if self.record_metrics:
+                self.success_once[:] = False
+                self.fail_once[:] = False
+                self.returns[:] = 0.0
 
-        idxs = set(range(self.num_envs)) if env_idx is None else set(env_idx.detach().cpu().tolist())
+    def _record_metrics(
+        self, step_reward: torch.Tensor, infos: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self.record_metrics:
+            return infos
+        episode_info: dict[str, Any] = {}
+        self.returns += step_reward
+        if "success" in infos:
+            self.success_once = self.success_once | infos["success"].bool()
+            episode_info["success_once"] = self.success_once.clone()
+        if "fail" in infos:
+            self.fail_once = self.fail_once | infos["fail"].bool()
+            episode_info["fail_once"] = self.fail_once.clone()
+
+        episode_info["return"] = self.returns.clone()
+        episode_info["episode_len"] = self.elapsed_steps.clone()
+        denom = torch.clamp(episode_info["episode_len"].float(), min=1.0)
+        episode_info["reward"] = episode_info["return"] / denom
+        infos["episode"] = episode_info
+        return infos
+
+    # -------------------- RLinf API: reset/step (match ManiSkill style) --------------------
+    def reset(
+        self,
+        *,
+        seed: Optional[Union[int, list[int]]] = None,
+        options: Optional[dict] = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if options is None:
+            seed = self.seed if seed is None else seed
+            options = {}
+
+        env_idx = options.get("env_idx", None) if isinstance(options, dict) else None
+        reset_options = dict(options)
+        reset_options.pop("env_idx", None)
+
+        if env_idx is None:
+            idxs = range(self.num_envs)
+            self._reset_metrics()
+            self._needs_reset[:] = False
+        else:
+            env_idx = torch.as_tensor(env_idx, dtype=torch.int64, device=self.device)
+            idxs = env_idx.detach().cpu().tolist()
+            self._reset_metrics(env_idx)
+            self._needs_reset[env_idx] = False
 
         obs_list, info_list = [], []
         for i in range(self.num_envs):
             if i in idxs:
-                seed_i = None if seed is None else (int(seed[i]) if isinstance(seed, (list, tuple, np.ndarray)) else int(seed) + i)
-                raw_obs, info = self._gym_reset(self.envs[i], seed_i, reset_options)
-                obs_list.append(self._wrap_obs_one(raw_obs))
+                seed_i = None
+                if seed is not None:
+                    seed_i = (
+                        int(seed[i])
+                        if isinstance(seed, (list, tuple, np.ndarray))
+                        else int(seed) + i
+                    )
+                raw_obs, info = self.envs[i].reset(seed=seed_i, options=reset_options)
+                obs_list.append(self._wrap_obs(raw_obs))
                 info_list.append(info if isinstance(info, dict) else {})
             else:
-                obs_list.append({k: v[i] for k, v in self._last_obs.items()} if self._last_obs else self._wrap_obs_one(self._gym_reset(self.envs[i])[0]))
+                obs_list.append(self._index_cached_obs(i))
                 info_list.append({})
 
         obs = self._collate_obs(obs_list)
         infos = self._collate_infos(info_list)
 
-        if env_idx is None:
-            self._reset_metrics()
-            self._needs_reset[:] = False
-        else:
-            self._reset_metrics(env_idx)
-            self._needs_reset[env_idx] = False
-
         self._is_start = True
         self._last_obs, self._last_info = obs, infos
-        if self.video_cfg and getattr(self.video_cfg, "save_video", False):
-            self.render_images = []
         return obs, infos
 
-    def step(self, actions: Union[np.ndarray, torch.Tensor] = None, auto_reset: bool = True):
-        if actions is None:
-            raise ValueError("actions cannot be None")
-        if isinstance(actions, dict):
-            raise NotImplementedError("dict actions not supported")
+    def step(
+        self,
+        actions: Union[np.ndarray, torch.Tensor],
+        auto_reset: bool = True,
+    ) -> tuple[
+        dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]
+    ]:
+        act_np = self._normalize_actions(actions)
 
-        act_np = actions.detach().cpu().numpy() if isinstance(actions, torch.Tensor) else np.asarray(actions)
-        if act_np.ndim == 1:
-            act_np = np.repeat(act_np[None, :], self.num_envs, axis=0)
-        act_np = act_np.astype(np.float32, copy=False)
-
-        obs_list, info_list, rew_list, term_list, trunc_list = [], [], [], [], []
-        stepped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        obs_list, info_list = [], []
+        rew_list, term_list, trunc_list = [], [], []
+        stepped_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         for i, env in enumerate(self.envs):
-            if self._needs_reset[i]:
-                if auto_reset and self.auto_reset:
-                    env.reset()
-                    self._needs_reset[i] = False
-                    self._reset_metrics(torch.tensor([i], device=self.device))
-                else:
-                    obs_list.append({k: v[i] for k, v in self._last_obs.items()})
-                    info_list.append({})
-                    rew_list.append(0.0)
-                    term_list.append(True)
-                    trunc_list.append(False)
-                    continue
+            obs_i, info_i, rew_i, term_i, trunc_i, stepped = self._step_one_env(
+                env_idx=i,
+                env=env,
+                action=act_np[i],
+                auto_reset=auto_reset,
+            )
+            obs_list.append(obs_i)
+            info_list.append(info_i)
+            rew_list.append(rew_i)
+            term_list.append(term_i)
+            trunc_list.append(trunc_i)
+            stepped_mask[i] = stepped
 
-            act_i = np.clip(act_np[i].reshape(-1), -1.0, 1.0)
-            out = env.step(act_i)
-            if len(out) == 5:
-                raw_obs, rew, terminated, truncated, info = out
-            else:
-                raw_obs, rew, done, info = out
-                terminated, truncated = bool(done), False
-
-            obs_list.append(self._wrap_obs_one(raw_obs))
-            info_list.append(info if isinstance(info, dict) else {})
-            rew_list.append(float(rew))
-            term_list.append(bool(terminated))
-            trunc_list.append(bool(truncated))
-            stepped[i] = True
-
-        self._elapsed_steps[stepped] += 1
+        self._elapsed_steps[stepped_mask] += 1
 
         obs = self._collate_obs(obs_list)
         infos = self._collate_infos(info_list)
 
         raw_reward = torch.tensor(rew_list, device=self.device, dtype=torch.float32)
-        step_reward = (raw_reward - self.prev_step_reward) if self.use_rel_reward else raw_reward
-        self.prev_step_reward = raw_reward
+        step_reward = self._calc_step_reward(raw_reward)
 
-        step_reward *= float(_cfg_get(self.cfg, "reward_scale", 1e5))
+        reward_scale = float(_cfg_get(self.cfg, "reward_scale", 1e5))
+        step_reward = step_reward * reward_scale
 
         terminations = torch.tensor(term_list, device=self.device, dtype=torch.bool)
         truncations = torch.tensor(trunc_list, device=self.device, dtype=torch.bool)
 
+        if self.video_cfg and getattr(self.video_cfg, "save_video", False):
+            self.add_new_frames_from_obs(obs)
+
         infos = self._record_metrics(step_reward, infos)
 
         if self.ignore_terminations:
-            terminations = torch.zeros_like(terminations)
+            terminations[:] = False
+            if self.record_metrics and "episode" in infos:
+                if "success" in infos:
+                    infos["episode"]["success_at_end"] = infos["success"].clone()
+                if "fail" in infos:
+                    infos["episode"]["fail_at_end"] = infos["fail"].clone()
 
-        dones = terminations | truncations
+        dones = torch.logical_or(terminations, truncations)
 
-        if self.video_cfg and getattr(self.video_cfg, "save_video", False):
-            self.add_new_frames(obs, {"reward": step_reward, "done": dones, "task": self.instruction})
-
-        _auto = bool(auto_reset) and bool(self.auto_reset)
-        if dones.any() and not _auto:
-            self._needs_reset |= dones
-
-        self._last_obs, self._last_info = obs, infos
-
-        if dones.any() and _auto:
+        _auto_reset = bool(auto_reset) and bool(self.auto_reset)
+        if dones.any() and _auto_reset:
             if self.video_cfg and getattr(self.video_cfg, "save_video", False):
-                self.flush_video(sub_dir="eval")
+                self.flush_video(video_sub_dir="eval")
             obs, infos = self._handle_auto_reset(dones, obs, infos)
 
+        self._last_obs, self._last_info = obs, infos
         return obs, step_reward, terminations, truncations, infos
 
-    def _handle_auto_reset(self, dones: torch.Tensor, obs: Dict[str, Any], infos: Dict[str, Any]):
-        final_obs = torch_clone(obs)
-        final_info = torch_clone(infos)
+    def _normalize_actions(
+        self, actions: Union[np.ndarray, torch.Tensor]
+    ) -> np.ndarray:
+        act_np = (
+            actions.detach().cpu().numpy()
+            if isinstance(actions, torch.Tensor)
+            else np.asarray(actions)
+        )
+        if act_np.ndim == 1:
+            act_np = np.repeat(act_np[None, :], self.num_envs, axis=0)
+        if act_np.shape[0] != self.num_envs:
+            raise ValueError(
+                "Invalid action batch dimension. Expected shape [num_envs, act_dim] "
+                f"with num_envs={self.num_envs}, got {act_np.shape}."
+            )
+        return act_np.astype(np.float32, copy=False)
 
-        env_idx = torch.arange(self.num_envs, device=self.device)[dones]
-        new_obs, new_infos = self.reset(options={"env_idx": env_idx})
+    def _step_one_env(
+        self,
+        env_idx: int,
+        env: gym.Env,
+        action: np.ndarray,
+        auto_reset: bool,
+    ) -> tuple[dict[str, Any], dict, float, bool, bool, bool]:
+        if self._needs_reset[env_idx]:
+            if auto_reset and self.auto_reset:
+                env.reset()
+                self._needs_reset[env_idx] = False
+                self._reset_metrics(torch.tensor([env_idx], device=self.device))
+            else:
+                return self._index_cached_obs(env_idx), {}, 0.0, True, False, False
 
-        new_infos = dict(new_infos)
-        new_infos.update({
-            "final_observation": final_obs,
-            "final_info": final_info,
-            "_final_info": dones,
-            "_final_observation": dones,
-            "_elapsed_steps": dones,
-        })
-        self._needs_reset[env_idx] = False
-        self._last_obs, self._last_info = new_obs, new_infos
-        return new_obs, new_infos
+        out = env.step(np.clip(action.reshape(-1), -1.0, 1.0))
+        if len(out) == 5:
+            raw_obs, rew, terminated, truncated, info = out
+        else:
+            raw_obs, rew, done, info = out
+            terminated, truncated = bool(done), False
 
+        obs = self._wrap_obs(raw_obs)
+        info = info if isinstance(info, dict) else {}
+        return obs, info, float(rew), bool(terminated), bool(truncated), True
+
+    def _index_cached_obs(self, env_idx: int) -> dict[str, Any]:
+        if self._last_obs is None:
+            raw_obs, _ = self.envs[env_idx].reset()
+            return self._wrap_obs(raw_obs)
+        out: dict[str, Any] = {}
+        for k, v in self._last_obs.items():
+            if isinstance(v, torch.Tensor) and v.shape[0] == self.num_envs:
+                out[k] = v[env_idx]
+            elif isinstance(v, list) and len(v) == self.num_envs:
+                out[k] = v[env_idx]
+            else:
+                out[k] = v
+        return out
+
+    def _handle_auto_reset(
+        self,
+        dones: torch.Tensor,
+        obs: dict[str, Any],
+        infos: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        final_obs = _torch_clone_dict(obs)
+        final_info = _torch_clone_dict(infos)
+
+        env_idx = torch.arange(0, self.num_envs, device=self.device)[dones]
+        obs, infos = self.reset(options={"env_idx": env_idx})
+
+        infos = dict(infos)
+        infos["final_observation"] = final_obs
+        infos["final_info"] = final_info
+        infos["_final_info"] = dones
+        infos["_final_observation"] = dones
+        infos["_elapsed_steps"] = dones
+        return obs, infos
+
+    # -------------------- chunk_step / sample_action_space (match ManiSkill style) --------------------
     def chunk_step(self, chunk_actions: Union[np.ndarray, torch.Tensor]):
-        ca = chunk_actions if isinstance(chunk_actions, torch.Tensor) else torch.from_numpy(np.asarray(chunk_actions))
-        if ca.ndim != 3:
-            raise ValueError(f"chunk_actions must be [B,T,A], got {tuple(ca.shape)}")
-        B, T, _ = ca.shape
-        if B != self.num_envs:
-            raise ValueError(f"chunk_actions batch={B} != num_envs={self.num_envs}")
+        chunk_actions = (
+            chunk_actions
+            if isinstance(chunk_actions, torch.Tensor)
+            else torch.from_numpy(np.asarray(chunk_actions))
+        )
+        if chunk_actions.ndim != 3:
+            raise ValueError(
+                "chunk_actions must have shape [num_envs, chunk_steps, act_dim], "
+                f"got {tuple(chunk_actions.shape)}."
+            )
 
-        rewards, terms, truncs = [], [], []
-        infos = {}
-        for t in range(T):
-            obs, r, term, trunc, infos = self.step(ca[:, t].to(self.device), auto_reset=False)
-            rewards.append(r)
-            terms.append(term)
-            truncs.append(trunc)
+        chunk_size = int(chunk_actions.shape[1])
+        chunk_rewards, raw_terms, raw_truncs = [], [], []
+        infos: dict[str, Any] = {}
 
-        rewards = torch.stack(rewards, dim=1)
-        terms = torch.stack(terms, dim=1)
-        truncs = torch.stack(truncs, dim=1)
+        for i in range(chunk_size):
+            actions = chunk_actions[:, i].to(self.device)
+            obs, rew, term, trunc, infos = self.step(actions, auto_reset=False)
+            chunk_rewards.append(rew)
+            raw_terms.append(term)
+            raw_truncs.append(trunc)
 
-        past_done = (terms.any(dim=1) | truncs.any(dim=1))
-        if past_done.any() and self.auto_reset:
-            obs, infos = self._handle_auto_reset(past_done, obs, infos)
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_terms = torch.stack(raw_terms, dim=1)
+        raw_truncs = torch.stack(raw_truncs, dim=1)
 
-        # only mark done at last timestep
-        chunk_terms = torch.zeros_like(terms)
-        chunk_terms[:, -1] = terms.any(dim=1)
-        chunk_truncs = torch.zeros_like(truncs)
-        chunk_truncs[:, -1] = truncs.any(dim=1)
-        return obs, rewards, chunk_terms, chunk_truncs, infos
+        past_terminations = raw_terms.any(dim=1)
+        past_truncations = raw_truncs.any(dim=1)
+        past_dones = torch.logical_or(past_terminations, past_truncations)
 
-    def sample_action_space(self):
-        return torch.from_numpy(np.asarray(self.action_space.sample(), np.float32)).to(self.device)
+        if past_dones.any() and self.auto_reset:
+            obs, infos = self._handle_auto_reset(past_dones, obs, infos)
 
-    def close(self):
-        for e in self.envs:
-            try:
-                e.close()
-            except Exception:
-                pass
-        self.envs = []
+        chunk_terminations = torch.zeros_like(raw_terms)
+        chunk_terminations[:, -1] = past_terminations
 
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
+        chunk_truncations = torch.zeros_like(raw_truncs)
+        chunk_truncations[:, -1] = past_truncations
 
-    def _init_reset_state_ids(self):
-        self.reset_state_ids = None
+        return obs, chunk_rewards, chunk_terminations, chunk_truncations, infos
 
-    def update_reset_state_ids(self):
-        return
+    def sample_action_space(self) -> torch.Tensor:
+        a = self.action_space.sample()
+        return torch.from_numpy(np.asarray(a, dtype=np.float32)).to(self.device)
+
+    # -------------------- video helpers (match ManiSkill style) --------------------
+    def add_new_frames_from_obs(self, obs: dict[str, Any]) -> None:
+        if "main_images" not in obs:
+            return
+        raw_imgs = obs["main_images"].detach().cpu().numpy()
+        full_img = rlinf_utils.tile_images(
+            list(raw_imgs), nrows=int(np.sqrt(self.num_envs))
+        )
+        self.render_images.append(full_img)
+
+    def flush_video(self, video_sub_dir: Optional[str] = None) -> None:
+        if not (self.video_cfg and getattr(self.video_cfg, "save_video", False)):
+            return
+        output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
+        if video_sub_dir:
+            output_dir = os.path.join(output_dir, video_sub_dir)
+        rlinf_utils.save_rollout_video(
+            self.render_images,
+            output_dir=output_dir,
+            video_name=f"{self.video_cnt}",
+        )
+        self.video_cnt += 1
+        self.render_images = []
