@@ -16,4 +16,4 @@ outputs/*
 *.so
 .venv
 uv.lock
-rlinf/envs/maniskill/assets
+rlinf/envs/maniskill/assetsrlinf/envs/mujoco/franka_sim/
