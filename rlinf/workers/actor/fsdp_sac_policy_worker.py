@@ -112,11 +112,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             raise NotImplementedError
         else:
             for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    if "q_head" in name:
-                        params_critic.append(param)
-                    else:
-                        params_actor.append(param)
+                if not param.requires_grad:
+                    continue
+                if ("encoders" in name) or ("encoder" in name):
+                    params_critic.append(param)
+                    continue
+                if "q_head" in name:
+                    params_critic.append(param)
+                    continue
+                else:
+                    params_actor.append(param)
+                    continue
+
         assert len(params_critic) > 0
         self.optimizer = torch.optim.Adam(
             [
