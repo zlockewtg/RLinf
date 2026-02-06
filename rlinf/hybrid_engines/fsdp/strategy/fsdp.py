@@ -68,10 +68,9 @@ class FSDPStrategy(FSDPStrategyBase):
 
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=model,
-            config=None,
+            config=self.cfg.fsdp_config,
             is_lora=self.cfg.model.is_lora,
-            is_openvla_model=SupportedModel(self.cfg.model.model_type)
-            in [SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT],
+            model_type=self.cfg.model.model_type
         )
 
         backward_prefetch = get_backward_prefetch_strategy(
