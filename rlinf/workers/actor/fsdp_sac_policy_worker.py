@@ -718,7 +718,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         return {}
 
     def save_checkpoint(self, save_base_path, step):
-        super().save_checkpoint(save_base_path, step)
+        super().save_checkpoint(
+            save_base_path,
+            step,
+            optimizer={"actor": self.optimizer, "critic": self.qf_optimizer},
+        )
         buffer_save_path = os.path.join(
             save_base_path, f"replay_buffer/rank_{self._rank}"
         )
@@ -730,7 +734,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.demo_buffer.save_checkpoint(demo_save_path)
 
     def load_checkpoint(self, load_base_path):
-        super().load_checkpoint(load_base_path)
+        super().load_checkpoint(
+            load_base_path,
+            optimizer={"actor": self.optimizer, "critic": self.qf_optimizer},
+        )
         buffer_load_path = os.path.join(
             load_base_path, f"replay_buffer/rank_{self._rank}"
         )
