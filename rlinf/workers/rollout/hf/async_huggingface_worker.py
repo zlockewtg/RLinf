@@ -152,3 +152,19 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             self._weight_sync_coalesced_total += 1
         self._weight_sync_requested = True
         self._start_background_weight_sync_if_needed()
+
+    async def finalize_background_weight_sync(self):
+        """Apply any in-flight async weight sync on this rollout worker.
+
+        Under ``sync_weight_no_wait``, weights are applied inside the infinite
+        ``_generate`` loop via :meth:`_poll_background_weight_sync`. Train
+        rollout may block on env I/O (e.g. during eval) and not reach another
+        poll for a long time. The driver calls this after each no-wait sync
+        (as a **second** concurrent actor invocation) so recv/apply can run on
+        the asyncio event loop while ``generate`` is awaiting I/O.
+        """
+        if not self._background_weight_sync_active:
+            return
+        while self._weight_sync_requested or self._weight_sync_work is not None:
+            await self._poll_background_weight_sync()
+            await asyncio.sleep(0)

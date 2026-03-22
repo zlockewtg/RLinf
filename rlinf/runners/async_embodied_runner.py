@@ -133,10 +133,16 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         self._pending_rollout_weight_sync = (rollout_handle, actor_handle)
 
+    def _finalize_rollout_weight_sync_if_no_wait(self) -> None:
+        if not self.sync_weight_no_wait:
+            return
+        self.rollout.finalize_background_weight_sync().wait()
+
     def run(self):
         start_step = self.global_step
         start_time = time.time()
         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
+        self._finalize_rollout_weight_sync_if_no_wait()
 
         env_handle: Handle = self.env.interact(
             input_channel=self.rollout_channel,
@@ -165,6 +171,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                     self.global_step += 1
                     if self.global_step % self.weight_sync_interval == 0:
                         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
+                        self._finalize_rollout_weight_sync_if_no_wait()
 
                     training_metrics = {
                         f"train/{k}": v
