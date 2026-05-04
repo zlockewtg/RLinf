@@ -531,13 +531,16 @@ class BehaviorEnv(gym.Env):
             )
             states = privileged_states
 
+        wrist_images = torch.stack(
+            [obs["wrist_images"] for obs in extracted_obs_list], axis=0
+        )
+
         obs = {
             "main_images": torch.stack(
                 [obs["main_images"] for obs in extracted_obs_list], axis=0
             ),  # [N_ENV, H, W, C]
-            "wrist_images": torch.stack(
-                [obs["wrist_images"] for obs in extracted_obs_list], axis=0
-            ),  # [N_ENV, N_IMG, H, W, C]
+            "wrist_images": wrist_images,  # [N_ENV, N_IMG, H, W, C]
+            "extra_view_images": wrist_images,  # CNNPolicy-compatible wrist views.
             "task_descriptions": [self.task_description for i in range(self.num_envs)],
             "states": states,
         }

@@ -19,6 +19,7 @@ from typing import Any, Literal, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
@@ -226,6 +227,59 @@ class CNNPolicy(nn.Module, BasePolicy):
     def num_action_chunks(self):
         return self.cfg.num_action_chunks
 
+    def _target_image_hw(self) -> tuple[int, int]:
+        image_size = self.cfg.image_size
+        assert len(image_size) == 3, (
+            "image_size should be in the format of (C, H, W) or (H, W, C)"
+        )
+        if image_size[0] == 3:
+            return int(image_size[1]), int(image_size[2])
+        return int(image_size[0]), int(image_size[1])
+
+    def _to_hwc_images(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 4:
+            raise ValueError(f"Expected 4D image tensor, got shape {images.shape}.")
+        if images.shape[-1] == 3:
+            return images
+        if images.shape[1] == 3:
+            return images.permute(0, 2, 3, 1)
+        raise ValueError(
+            "Expected images in [B, H, W, C] or [B, C, H, W] format, "
+            f"got shape {images.shape}."
+        )
+
+    def _resize_hwc_images(self, images: torch.Tensor) -> torch.Tensor:
+        images = self._to_hwc_images(images)
+        target_h, target_w = self._target_image_hw()
+        if images.shape[1] == target_h and images.shape[2] == target_w:
+            return images
+        chw = images.permute(0, 3, 1, 2)
+        resized = F.interpolate(
+            chw,
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized.permute(0, 2, 3, 1)
+
+    def _resize_extra_view_images(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 5:
+            raise ValueError(
+                f"Expected 5D extra-view image tensor, got shape {images.shape}."
+            )
+        batch_size, num_views = images.shape[:2]
+        if images.shape[-1] == 3:
+            flat = images.reshape(batch_size * num_views, *images.shape[2:])
+        elif images.shape[2] == 3:
+            flat = images.reshape(batch_size * num_views, *images.shape[2:])
+        else:
+            raise ValueError(
+                "Expected extra-view images in [B, N, H, W, C] or "
+                f"[B, N, C, H, W] format, got shape {images.shape}."
+            )
+        flat = self._resize_hwc_images(flat)
+        return flat.reshape(batch_size, num_views, *flat.shape[1:])
+
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
         mean = self.img_mean.to(device)
@@ -233,11 +287,18 @@ class CNNPolicy(nn.Module, BasePolicy):
 
         processed_env_obs = {}
         processed_env_obs["states"] = env_obs["states"].clone().to(device)
-        x = env_obs["main_images"].clone().to(device).float() / 255.0
+        x = self._resize_hwc_images(env_obs["main_images"].clone().to(device).float())
+        x = x / 255.0
         processed_env_obs["main_images"] = (x - mean) / std
 
-        if env_obs.get("extra_view_images", None) is not None:
-            ex = env_obs["extra_view_images"].clone().to(device).float() / 255.0
+        extra_view_images = env_obs.get("extra_view_images", None)
+        if extra_view_images is None:
+            extra_view_images = env_obs.get("wrist_images", None)
+        if extra_view_images is not None:
+            ex = self._resize_extra_view_images(
+                extra_view_images.clone().to(device).float()
+            )
+            ex = ex / 255.0
             ex = (ex - mean.unsqueeze(1)) / std.unsqueeze(1)
             processed_env_obs["extra_view_images"] = ex
 
@@ -292,6 +353,8 @@ class CNNPolicy(nn.Module, BasePolicy):
         }
         if "extra_view_images" in forward_inputs:
             obs["extra_view_images"] = forward_inputs["extra_view_images"]
+        elif "wrist_images" in forward_inputs:
+            obs["extra_view_images"] = forward_inputs["wrist_images"]
         obs = self.preprocess_env_obs(obs)
         action = forward_inputs["action"]
         full_feature, mix_feature, action_mean, action_logstd = (
@@ -428,6 +491,8 @@ class CNNPolicy(nn.Module, BasePolicy):
                 and env_obs["extra_view_images"] is not None
             ):
                 forward_inputs["extra_view_images"] = env_obs["extra_view_images"]
+            elif "wrist_images" in env_obs and env_obs["wrist_images"] is not None:
+                forward_inputs["extra_view_images"] = env_obs["wrist_images"]
 
         result = {
             "prev_logprobs": chunk_logprobs,

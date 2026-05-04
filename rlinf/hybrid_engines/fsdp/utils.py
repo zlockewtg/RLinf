@@ -255,6 +255,19 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
             )
         )
 
+    if hasattr(module, "privileged_token_proj") and not config.use_orig_params:
+        from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+
+        def is_privileged_token_proj(m):
+            return getattr(m, "_fsdp_wrap_name", None) == "privileged_token_proj"
+
+        policies.append(
+            functools.partial(
+                lambda_auto_wrap_policy,
+                lambda_fn=is_privileged_token_proj,
+            )
+        )
+
     if hasattr(module, "q_head"):
         from rlinf.models.embodiment.modules.q_head import MultiCrossQHead, MultiQHead
 

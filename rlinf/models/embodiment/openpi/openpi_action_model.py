@@ -30,6 +30,9 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.openpi.privileged_tokens import (
+    PrivilegedTeacherTokenProjector,
+)
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
@@ -84,8 +87,11 @@ class OpenPi0Config(Pi0Config):
 
     # ===== BEHAVIOR privileged teacher observation parameters =====
     use_privileged_teacher_obs: bool = False
+    privileged_teacher_injection: str = "state_projection"
     privileged_teacher_obs_dim: int = 226
     privileged_teacher_state_dim: int = 23
+    privileged_teacher_num_tokens: int = 5
+    privileged_teacher_token_hidden_dim: int = 256
 
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
@@ -168,24 +174,39 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             self.config, "add_value_head", False
         )
         if self.config.use_privileged_teacher_obs:
+            privileged_injection = self.config.privileged_teacher_injection
             # Match the OpenPI backbone dtype loaded below. These parameters are
             # created before checkpoint loading / FSDP wrapping, so leaving them
             # at PyTorch's default float32 makes FSDP flatten mixed bf16/fp32
             # parameters in the same handle.
             _privileged_dtype = torch.bfloat16
-            self.privileged_state_proj = nn.Sequential(
-                nn.LayerNorm(self.config.privileged_teacher_obs_dim),
-                nn.Linear(
-                    self.config.privileged_teacher_obs_dim,
-                    self.config.privileged_teacher_state_dim * 2,
-                ),
-                nn.SiLU(),
-                nn.Linear(
-                    self.config.privileged_teacher_state_dim * 2,
-                    self.config.privileged_teacher_state_dim,
-                ),
-            ).to(dtype=_privileged_dtype)
+            if privileged_injection == "state_projection":
+                self.privileged_state_proj = nn.Sequential(
+                    nn.LayerNorm(self.config.privileged_teacher_obs_dim),
+                    nn.Linear(
+                        self.config.privileged_teacher_obs_dim,
+                        self.config.privileged_teacher_state_dim * 2,
+                    ),
+                    nn.SiLU(),
+                    nn.Linear(
+                        self.config.privileged_teacher_state_dim * 2,
+                        self.config.privileged_teacher_state_dim,
+                    ),
+                ).to(dtype=_privileged_dtype)
+            elif privileged_injection == "prefix_tokens":
+                privileged_token_dim = 2048 if self.config.pi05 else 1024
+                self.privileged_token_proj = PrivilegedTeacherTokenProjector(
+                    embed_dim=privileged_token_dim,
+                    hidden_dim=self.config.privileged_teacher_token_hidden_dim,
+                    num_tokens=self.config.privileged_teacher_num_tokens,
+                ).to(dtype=_privileged_dtype)
+            else:
+                raise ValueError(
+                    "privileged_teacher_injection must be one of "
+                    f"'state_projection' or 'prefix_tokens', got {privileged_injection!r}"
+                )
         self._last_privileged_state_metrics = None
+        self._current_privileged_state = None
         # noise head for flow-noise
         if self.config.noise_method == "flow_noise":
             self.noise_head = ExploreNoiseNet(
@@ -557,6 +578,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def _apply_privileged_state_projection(self, processed_obs):
         self._last_privileged_state_metrics = None
+        self._current_privileged_state = None
         if not self.config.use_privileged_teacher_obs:
             processed_obs.pop("privileged_state", None)
             return processed_obs
@@ -567,7 +589,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         device = next(self.parameters()).device
         if not torch.is_tensor(privileged_state):
             privileged_state = torch.as_tensor(privileged_state)
-        projection_dtype = next(self.privileged_state_proj.parameters()).dtype
+        privileged_injection = self.config.privileged_teacher_injection
+        if privileged_injection == "state_projection":
+            projection_dtype = next(self.privileged_state_proj.parameters()).dtype
+        elif privileged_injection == "prefix_tokens":
+            projection_dtype = next(self.privileged_token_proj.parameters()).dtype
+        else:
+            raise ValueError(
+                "privileged_teacher_injection must be one of "
+                f"'state_projection' or 'prefix_tokens', got {privileged_injection!r}"
+            )
         privileged_state = privileged_state.to(
             device=device,
             dtype=projection_dtype,
@@ -579,6 +610,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         assert torch.isfinite(privileged_state).all(), (
             "privileged_state contains NaN/Inf before projection"
         )
+        if privileged_injection == "prefix_tokens":
+            self._current_privileged_state = privileged_state.contiguous()
+            with torch.no_grad():
+                self._last_privileged_state_metrics = {
+                    "actor/privileged/input_abs_mean": privileged_state.abs().mean(),
+                    "actor/privileged/input_l2": torch.linalg.vector_norm(
+                        privileged_state, dim=-1
+                    ).mean(),
+                }
+            return processed_obs
 
         projected_state = self.privileged_state_proj(privileged_state)
         assert projected_state.shape[-1] == self.config.privileged_teacher_state_dim, (
@@ -618,6 +659,64 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         metrics = self._last_privileged_state_metrics
         self._last_privileged_state_metrics = None
         return metrics or {}
+
+    def _append_privileged_prefix_tokens(
+        self,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+    ):
+        if (
+            not self.config.use_privileged_teacher_obs
+            or self.config.privileged_teacher_injection != "prefix_tokens"
+            or self._current_privileged_state is None
+        ):
+            return prefix_embs, prefix_pad_masks, prefix_att_masks
+
+        privileged_tokens = self.privileged_token_proj(self._current_privileged_state)
+        assert privileged_tokens.shape[-2] == self.config.privileged_teacher_num_tokens, (
+            "projected privileged prefix tokens expected token dim "
+            f"{self.config.privileged_teacher_num_tokens}, got "
+            f"{privileged_tokens.shape[-2]}"
+        )
+        assert privileged_tokens.shape[-1] == prefix_embs.shape[-1], (
+            "projected privileged prefix tokens expected embed dim "
+            f"{prefix_embs.shape[-1]}, got {privileged_tokens.shape[-1]}"
+        )
+        assert torch.isfinite(privileged_tokens).all(), (
+            "projected privileged prefix tokens contain NaN/Inf"
+        )
+        privileged_tokens = privileged_tokens.to(dtype=prefix_embs.dtype)
+
+        batch_size = prefix_embs.shape[0]
+        token_count = privileged_tokens.shape[1]
+        token_pad_masks = torch.ones(
+            batch_size,
+            token_count,
+            dtype=prefix_pad_masks.dtype,
+            device=prefix_pad_masks.device,
+        )
+        token_att_masks = torch.zeros(
+            batch_size,
+            token_count,
+            dtype=prefix_att_masks.dtype,
+            device=prefix_att_masks.device,
+        )
+        prefix_embs = torch.cat([prefix_embs, privileged_tokens], dim=1)
+        prefix_pad_masks = torch.cat([prefix_pad_masks, token_pad_masks], dim=1)
+        prefix_att_masks = torch.cat([prefix_att_masks, token_att_masks], dim=1)
+        with torch.no_grad():
+            metrics = dict(self._last_privileged_state_metrics or {})
+            metrics.update(
+                {
+                    "actor/privileged/prefix_token_abs_mean": privileged_tokens.abs().mean(),
+                    "actor/privileged/prefix_token_l2": torch.linalg.vector_norm(
+                        privileged_tokens, dim=-1
+                    ).mean(),
+                }
+            )
+            self._last_privileged_state_metrics = metrics
+        return prefix_embs, prefix_pad_masks, prefix_att_masks
 
     def predict_action_batch(
         self,
@@ -750,7 +849,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # add value based on the vlm for pi05, expert for pi0
         if self.use_vlm_value:
-            values_vlm = self.get_value_from_vlm(prefix_output)
+            values_vlm = self.get_value_from_vlm(prefix_output, prefix_pad_masks)
         if self.config.joint_logprob:
             initial_log_prob = self.get_logprob_norm(
                 x_t, torch.zeros_like(noise), torch.ones_like(noise)
@@ -999,6 +1098,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = (
+            self._append_privileged_prefix_tokens(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+            )
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
@@ -1096,7 +1202,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             if not self.use_vlm_value:
                 chains_values.append(value_t)
         if self.use_vlm_value:
-            chains_values.append(self.get_value_from_vlm(prefix_output))
+            chains_values.append(self.get_value_from_vlm(prefix_output, prefix_pad_masks))
         chains_log_probs = torch.stack(chains_log_probs, dim=1)
         chains_values = torch.stack(chains_values, dim=1)
 
@@ -1107,11 +1213,38 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             chains_entropy = torch.zeros_like(chains_log_probs)
         return chains_log_probs, chains_values, chains_entropy
 
-    def get_value_from_vlm(self, prefix_output):
+    def get_value_from_vlm(self, prefix_output, prefix_pad_masks=None):
         # prefix_output:
         # pi05: [bs, (256 * 3 + 200) = 968, 2048]
         # pi0: [bs, (256 * 3 + 48) = 816, 1024]
         # token length
+        use_dynamic_mask = (
+            self.config.use_privileged_teacher_obs
+            and self.config.privileged_teacher_injection == "prefix_tokens"
+            and prefix_pad_masks is not None
+        )
+        if use_dynamic_mask:
+            if self.config.value_vlm_mode == "mean_token":
+                prefix_mask = prefix_pad_masks.to(
+                    dtype=torch.bool,
+                    device=prefix_output.device,
+                )
+                denom = prefix_mask.sum(dim=1, keepdim=True).clamp(min=1)
+                prefix_out_value = (
+                    prefix_output * prefix_mask[:, :, None].to(prefix_output.dtype)
+                ).sum(dim=1) / denom.to(prefix_output.dtype)
+            elif self.config.value_vlm_mode == "last_token":
+                prefix_out_value = prefix_output[:, -1, :]
+            elif self.config.value_vlm_mode == "first_token":
+                prefix_out_value = prefix_output[:, 0, :]
+            else:
+                raise ValueError(
+                    f"Invalid value_vlm_mode: {self.config.value_vlm_mode}"
+                )
+            prefix_out_value = prefix_out_value.to(dtype=torch.float32)
+            values_vlm = self.value_head(prefix_out_value)[:, 0]
+            return values_vlm
+
         if "pi05_" in self.config.config_name:
             lang_token_len = 200
             all_token_length = 968

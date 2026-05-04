@@ -33,8 +33,11 @@ openpi:
   value_vlm_mode: "mean_token"
   detach_critic_input: null
   use_privileged_teacher_obs: False
+  privileged_teacher_injection: "state_projection"
   privileged_teacher_obs_dim: 226
   privileged_teacher_state_dim: 23
+  privileged_teacher_num_tokens: 5
+  privileged_teacher_token_hidden_dim: 256
 
   # DSRL specific configurations (disabled by default)
   use_dsrl: False

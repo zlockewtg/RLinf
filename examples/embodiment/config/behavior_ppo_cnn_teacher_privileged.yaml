@@ -1,0 +1,156 @@
+defaults:
+  - env/behavior_r1pro@env.train
+  - env/behavior_r1pro@env.eval
+  - model/cnn_policy@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,actor,rollout: 0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "behavior_ppo_cnn_teacher_privileged"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1000
+  max_steps: -1
+
+  only_eval: False
+  val_check_interval: 20
+  save_interval: 40
+
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: True
+  kl_penalty: kl
+  group_size: 1
+  rollout_epoch: 8
+  eval_rollout_epoch: 1
+  update_epoch: 2
+
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: chunk_level
+
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: "token-mean"
+  kl_beta: 0.0
+  entropy_bonus: 0.005
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+
+  train:
+    use_privileged_teacher_obs: True
+    total_num_envs: 1
+    max_episode_steps: 512
+    max_steps_per_rollout_epoch: 512
+    omni_config:
+      camera:
+        head_resolution: [128, 128]
+        wrist_resolution: [128, 128]
+
+  eval:
+    use_privileged_teacher_obs: True
+    total_num_envs: 1
+    max_episode_steps: 512
+    max_steps_per_rollout_epoch: 512
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    omni_config:
+      camera:
+        head_resolution: [128, 128]
+        wrist_resolution: [128, 128]
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+
+  model:
+    # Directory containing encoder_config.ckpt_name, e.g. resnet10_pretrained.pt.
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+  enable_torch_compile: True
+  enable_cuda_graph: False
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 256
+  global_batch_size: 256
+  seed: 1234
+  enable_offload: False
+
+  model:
+    # Replace with the local RLinf ResNet10 pretrained model directory.
+    model_path: "/path/to/RLinf-ResNet10-pretrained"
+    add_value_head: True
+    add_q_head: False
+    image_num: 3
+    image_size: [3, 128, 128]
+    state_dim: 226
+    action_dim: 23
+    num_action_chunks: 1
+
+  optim:
+    lr: 5.0e-5
+    value_lr: 2.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-05
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
