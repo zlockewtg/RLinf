@@ -1,0 +1,161 @@
+defaults:
+  - behavior_ppo_openpi_pi05
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+skill_train:
+  dataset_root: /mnt/public/mjwei/download_models/2025-challenge-demos
+  task_id: 0
+  skill_name: "move to"
+  prompt: move to obj
+  activity_name: turning_on_radio
+  activity_definition_id: 0
+  scene_model: house_double_floor_lower
+  train_instance_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  eval_instance_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    rollout:
+      placement: 0-1
+    actor:
+      placement: 0-1
+    env:
+      placement: 2-3
+
+runner:
+  logger:
+    experiment_name: "behavior_ppo_openpi05_train_move_to_${skill_train.activity_name}"
+  max_epochs: 1000
+  max_steps: 1000
+  save_interval: 20
+
+algorithm:
+  rollout_epoch: 16
+  eval_rollout_epoch: 1
+  reward_coef: 1.0
+  filter_rewards: False
+  gamma: 0.99
+  gae_lambda: 0.95
+  sampling_params:
+    temperature_train: 0.6
+
+rollout:
+  sync_weight_load_instant: False
+  model:
+    model_path: /mnt/public/tgy/ckpts/pi05-turning_on_radio-sft-pytorch
+
+actor:
+  micro_batch_size: 4
+  global_batch_size: 512
+  optim:
+    lr: 5.0e-6
+    value_lr: 1.0e-4
+    clip_grad: 1.0
+  model:
+    model_path: ${rollout.model.model_path}
+    trainable_action_groups: ["mobile_base"]
+    openpi:
+      noise_level: 0.3
+      value_after_vlm: True
+      ignore_last: True
+    openpi_data:
+      assets:
+        assets_dir: ${actor.model.model_path}
+        asset_id: assets/behavior-1k/2025-challenge-demos
+
+env:
+  train:
+    total_num_envs: 8
+    max_episode_steps: 2048
+    max_steps_per_rollout_epoch: 2048
+    reward_coef: ${algorithm.reward_coef}
+    num_env_subprocess: 2
+    use_subtask_prompt: True
+    subtask_prompt_override: ${skill_train.prompt}
+    skip_intermediate_obs_in_chunk: False
+    distance_reward:
+      enabled: True
+      target_object: auto
+      distance_axes: xy
+      scale: 1.0
+      success_threshold: 1.0
+      success_bonus: 0.0
+    replay_init:
+      enabled: True
+      dataset_root: ${skill_train.dataset_root}
+      task_id: ${skill_train.task_id}
+      skill_name: ${skill_train.skill_name}
+      stage_boundary: start
+      replay_ratio: 1.0
+      jitter_steps: 0
+      noise_std: 0.0
+    omni_config:
+      env:
+        action_frequency: 30
+        physics_frequency: 120
+        rendering_frequency: 30
+      task:
+        activity_name: ${skill_train.activity_name}
+        activity_definition_id: ${skill_train.activity_definition_id}
+        activity_instance_dir: ${oc.env:OMNIGIBSON_DATA_PATH}/2025-challenge-task-instances/scenes/${skill_train.scene_model}/json/${skill_train.scene_model}_task_${skill_train.activity_name}_instances
+        activity_instance_id: ${skill_train.train_instance_ids}
+        instance_file_format: tro_state
+        instance_resample_mode: offline
+        online_object_sampling: False
+        use_presampled_robot_pose: True
+        reward_config:
+          reward_mode: stage
+          task_specific_reward_name: ${skill_train.activity_name}
+      scene:
+        scene_model: ${skill_train.scene_model}
+
+  eval:
+    total_num_envs: 8
+    max_episode_steps: 2048
+    max_steps_per_rollout_epoch: 2048
+    use_subtask_prompt: True
+    subtask_prompt_override: ${skill_train.prompt}
+    skip_intermediate_obs_in_chunk: False
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    distance_reward:
+      enabled: True
+      target_object: auto
+      distance_axes: xy
+      scale: 1.0
+      success_threshold: 1.0
+      success_bonus: 0.0
+    replay_init:
+      enabled: True
+      dataset_root: ${skill_train.dataset_root}
+      task_id: ${skill_train.task_id}
+      skill_name: ${skill_train.skill_name}
+      stage_boundary: start
+      replay_ratio: 1.0
+      jitter_steps: 0
+      noise_std: 0.0
+    omni_config:
+      env:
+        action_frequency: 30
+        physics_frequency: 120
+        rendering_frequency: 30
+      task:
+        activity_name: ${skill_train.activity_name}
+        activity_definition_id: ${skill_train.activity_definition_id}
+        activity_instance_dir: ${oc.env:OMNIGIBSON_DATA_PATH}/2025-challenge-task-instances/scenes/${skill_train.scene_model}/json/${skill_train.scene_model}_task_${skill_train.activity_name}_instances
+        activity_instance_id: ${skill_train.eval_instance_ids}
+        instance_file_format: tro_state
+        instance_resample_mode: offline
+        online_object_sampling: False
+        use_presampled_robot_pose: True
+        reward_config:
+          reward_mode: stage
+          task_specific_reward_name: ${skill_train.activity_name}
+      scene:
+        scene_model: ${skill_train.scene_model}

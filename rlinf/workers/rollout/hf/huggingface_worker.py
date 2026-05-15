@@ -14,6 +14,8 @@
 
 import copy
 import gc
+import os
+import re
 from typing import Any, Literal
 
 import numpy as np
@@ -87,6 +89,11 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
+        self.skill_chain_policy_paths = self._resolve_skill_chain_policy_paths()
+        self.skill_chain_models: dict[str, BasePolicy] = {}
+        self._skill_chain_model_config = None
+        self._active_skill_chain_policy: str | None = None
+        self._skill_chain_last_eval_action: torch.Tensor | None = None
 
         weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer", default=None)
         assert weight_syncer_cfg is not None, (
@@ -99,6 +106,7 @@ class MultiStepRolloutWorker(Worker):
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
+        self._skill_chain_model_config = copy.deepcopy(rollout_model_config)
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
@@ -122,6 +130,7 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
+        self._register_base_skill_chain_model(rollout_model_config.model_path)
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -160,6 +169,75 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+    @staticmethod
+    def _normalize_skill_text(text: str | None) -> str:
+        text = "" if text is None else str(text).lower().replace("_", " ")
+        return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+    def _resolve_skill_chain_policy_paths(self) -> dict[str, str]:
+        policy_map = OmegaConf.select(
+            self.cfg, "rollout.skill_chain.policy_map", default=None
+        )
+        if policy_map is None:
+            policy_map = OmegaConf.select(
+                self.cfg, "env.eval.skill_chain.policy_map", default=None
+            )
+        if policy_map is None:
+            return {}
+        policy_map = OmegaConf.to_container(policy_map, resolve=True)
+        return {
+            self._normalize_skill_text(skill_name): str(model_path)
+            for skill_name, model_path in dict(policy_map).items()
+        }
+
+    @staticmethod
+    def _same_model_path(lhs: str, rhs: str) -> bool:
+        return os.path.realpath(os.path.expanduser(str(lhs))) == os.path.realpath(
+            os.path.expanduser(str(rhs))
+        )
+
+    def _register_base_skill_chain_model(self, base_model_path: str):
+        for key, model_path in self.skill_chain_policy_paths.items():
+            if self._same_model_path(model_path, base_model_path):
+                self.skill_chain_models[key] = self.hf_model
+
+    def _get_skill_chain_model(self, policy_name: str) -> BasePolicy:
+        key = self._normalize_skill_text(policy_name)
+        if key not in self.skill_chain_policy_paths:
+            raise ValueError(
+                f"No rollout.skill_chain.policy_map entry for skill {policy_name!r}. "
+                f"Available skills: {sorted(self.skill_chain_policy_paths)}"
+            )
+        if key not in self.skill_chain_models:
+            model_config = copy.deepcopy(self._skill_chain_model_config)
+            model_path = self.skill_chain_policy_paths[key]
+            with open_dict(model_config):
+                model_config.model_path = model_path
+                if (
+                    "openpi_data" in model_config
+                    and "assets" in model_config.openpi_data
+                    and "assets_dir" in model_config.openpi_data.assets
+                ):
+                    model_config.openpi_data.assets.assets_dir = model_path
+            model = get_model(model_config)
+            model.eval()
+            if self.enable_offload:
+                model.to("cpu")
+            self.skill_chain_models[key] = model
+        return self.skill_chain_models[key]
+
+    def _activate_skill_chain_model(self, policy_name: str) -> BasePolicy:
+        key = self._normalize_skill_text(policy_name)
+        if self.enable_offload and self._active_skill_chain_policy != key:
+            if self._active_skill_chain_policy in self.skill_chain_models:
+                self.skill_chain_models[self._active_skill_chain_policy].to("cpu")
+                self.torch_platform.empty_cache()
+        model = self._get_skill_chain_model(key)
+        if self.enable_offload and self._active_skill_chain_policy != key:
+            model.to(self.device)
+            self._active_skill_chain_policy = key
+        return model
 
     def setup_sample_params(self):
         # length parameters for rollout
@@ -251,6 +329,71 @@ class MultiStepRolloutWorker(Worker):
             dst_rank=self._rank,
         )
 
+    def _predict_skill_chain(
+        self,
+        env_obs: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor | None, dict[str, Any]]:
+        policies = env_obs.get("skill_chain_policy")
+        if not isinstance(policies, list):
+            return None, {}
+
+        batch_size = len(policies)
+        action_shape = (
+            batch_size,
+            int(self.cfg.actor.model.num_action_chunks),
+            int(self.cfg.actor.model.action_dim),
+        )
+        actions_out = torch.zeros(action_shape, dtype=torch.float32)
+        if (
+            self._skill_chain_last_eval_action is not None
+            and self._skill_chain_last_eval_action.shape == (batch_size, action_shape[-1])
+        ):
+            actions_out = self._skill_chain_last_eval_action[:, None, :].expand(
+                action_shape
+            ).clone()
+        active_groups: dict[str, list[int]] = {}
+        for idx, policy_name in enumerate(policies):
+            key = self._normalize_skill_text(policy_name)
+            if key in {"done", "failed", "unknown"} or key.startswith("__"):
+                continue
+            active_groups.setdefault(key, []).append(idx)
+
+        for policy_name, indices in active_groups.items():
+            model = self._activate_skill_chain_model(policy_name)
+            group_obs = {}
+            index_tensor = torch.tensor(indices, dtype=torch.long)
+            for obs_key, value in env_obs.items():
+                if obs_key == "skill_chain_policy":
+                    continue
+                if isinstance(value, torch.Tensor):
+                    group_obs[obs_key] = value.index_select(0, index_tensor)
+                elif isinstance(value, list):
+                    group_obs[obs_key] = [value[i] for i in indices]
+                else:
+                    group_obs[obs_key] = value
+            group_actions, _ = model.predict_action_batch(env_obs=group_obs, **kwargs)
+            if isinstance(group_actions, np.ndarray):
+                group_actions = torch.from_numpy(group_actions)
+            actions_out[index_tensor] = group_actions.detach().cpu().float()
+
+        active_indices = [idx for indices in active_groups.values() for idx in indices]
+        if active_indices:
+            if (
+                self._skill_chain_last_eval_action is None
+                or self._skill_chain_last_eval_action.shape
+                != (batch_size, action_shape[-1])
+            ):
+                self._skill_chain_last_eval_action = torch.zeros(
+                    (batch_size, action_shape[-1]), dtype=torch.float32
+                )
+            active_index_tensor = torch.tensor(active_indices, dtype=torch.long)
+            self._skill_chain_last_eval_action[active_index_tensor] = actions_out[
+                active_index_tensor, -1
+            ]
+
+        return actions_out, {"expert_label_flag": False}
+
     @Worker.timer("predict")
     def predict(
         self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
@@ -273,6 +416,13 @@ class MultiStepRolloutWorker(Worker):
                 kwargs = {"mode": "eval"}
             else:
                 kwargs = {"mode": mode}
+
+        if mode == "eval" and self.skill_chain_policy_paths:
+            skill_chain_actions, skill_chain_result = self._predict_skill_chain(
+                env_obs, kwargs
+            )
+            if skill_chain_actions is not None:
+                return skill_chain_actions, skill_chain_result
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.CNN_POLICY,
@@ -456,13 +606,14 @@ class MultiStepRolloutWorker(Worker):
             self.offload_model()
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
-        if self.enable_offload:
+        if self.enable_offload and not self.skill_chain_policy_paths:
             self.reload_model()
         for _ in tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
         ):
+            self._skill_chain_last_eval_action = None
             for _ in range(self.n_eval_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
@@ -476,6 +627,9 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_cuda_graph:
             self.hf_model.release_cuda_graph()
         self.hf_model.to("cpu")
+        for model in self.skill_chain_models.values():
+            model.to("cpu")
+        self._active_skill_chain_policy = None
         self.torch_platform.empty_cache()
 
     def reload_model(self):

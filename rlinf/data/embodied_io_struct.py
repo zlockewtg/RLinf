@@ -102,14 +102,22 @@ class EnvOutput:
             if "task_descriptions" in obs and obs["task_descriptions"] is not None
             else None
         )
+        skill_chain_policy = (
+            list(obs["skill_chain_policy"])
+            if "skill_chain_policy" in obs and obs["skill_chain_policy"] is not None
+            else None
+        )
 
-        return {
+        prepared = {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
         }
+        if skill_chain_policy is not None:
+            prepared["skill_chain_policy"] = skill_chain_policy
+        return prepared
 
     @staticmethod
     def merge_env_outputs(env_outputs: list[dict]) -> dict[str, Any]:

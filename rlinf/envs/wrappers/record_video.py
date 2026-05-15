@@ -83,6 +83,7 @@ class RecordVideo(gym.Wrapper):
         self._save_futures: list[Future] = []
         self._max_buffered_frames = int(getattr(video_cfg, "max_buffered_frames", 256))
         self._max_pending_saves = int(getattr(video_cfg, "max_pending_saves", 2))
+        self._min_final_frames = int(getattr(video_cfg, "min_final_frames", 2))
 
         if fps is not None:
             self._fps = fps
@@ -236,6 +237,12 @@ class RecordVideo(gym.Wrapper):
             return task_desc[0] if isinstance(task_desc, (list, tuple)) else task_desc
         return None
 
+    def _get_obs_value(self, obs: Any, key: str, env_id: int) -> Any:
+        """Read a per-env value from an observation dict."""
+        if not isinstance(obs, dict) or key not in obs:
+            return None
+        return self._coerce_overlay_value(self._value_for_env(obs[key], env_id))
+
     def _get_subtask_prompt(self, obs: Any, env_id: int) -> Optional[str]:
         """Extract the current subtask prompt from task descriptions when present."""
         if not bool(getattr(self.env, "use_subtask_prompt", False)):
@@ -256,6 +263,168 @@ class RecordVideo(gym.Wrapper):
                 prompt = line.split(marker, 1)[1].strip()
                 return prompt or None
         return task_desc
+
+    def _cfg_value(self, dotted_key: str, default: Any = None) -> Any:
+        """Read a dotted key from the wrapped env config."""
+        value = getattr(self.env, "cfg", None)
+        for part in dotted_key.split("."):
+            if value is None:
+                return default
+            if isinstance(value, dict):
+                value = value.get(part, default)
+                continue
+            getter = getattr(value, "get", None)
+            if callable(getter):
+                try:
+                    value = getter(part, default)
+                    continue
+                except Exception:
+                    pass
+            value = getattr(value, part, default)
+        return value
+
+    def _is_move_to_eval(self) -> bool:
+        """Whether this video belongs to the BEHAVIOR move_to skill eval."""
+        return bool(self._cfg_value("move_to_eval.enabled", False))
+
+    def _is_skill_chain_eval(self) -> bool:
+        """Whether this video belongs to a BEHAVIOR skill-chain eval."""
+        return bool(self._cfg_value("skill_chain.enabled", False))
+
+    @staticmethod
+    def _target_object_from_prompt(prompt: Optional[str]) -> Optional[str]:
+        """Infer the target object from prompts such as 'move to radio'."""
+        if not prompt:
+            return None
+        prompt = str(prompt).strip()
+        lowered = prompt.lower()
+        for prefix in ("move to ", "navigate to ", "go to "):
+            if lowered.startswith(prefix):
+                return prompt[len(prefix) :].strip() or None
+        return None
+
+    def _get_move_to_eval_info_item(
+        self,
+        obs: Any,
+        infos: Optional[Any],
+        env_id: int,
+    ) -> dict[str, Any]:
+        """Build the requested BEHAVIOR move_to overlay fields."""
+        prompt = self._get_subtask_prompt(obs, env_id)
+        if self._target_object_from_prompt(prompt) is None:
+            cached_prompts = getattr(self.env, "_current_stage_prompts", None)
+            if isinstance(cached_prompts, (list, tuple)) and len(cached_prompts) > env_id:
+                cached_prompt = cached_prompts[env_id]
+                if self._target_object_from_prompt(cached_prompt) is not None:
+                    prompt = cached_prompt
+        target_object = self._target_object_from_prompt(prompt)
+        target_distance = self._lookup_first_info_value(
+            infos,
+            [
+                "episode.target_distance",
+                "reward.distance.target_distance",
+                "target_distance",
+            ],
+            env_id,
+        )
+        if isinstance(target_distance, numbers.Number) and not np.isfinite(
+            float(target_distance)
+        ):
+            target_distance = "N/A"
+        success = self._lookup_first_info_value(
+            infos,
+            [
+                "episode.success_at_end",
+                "episode.success_once",
+                "success_at_end",
+                "success_once",
+            ],
+            env_id,
+        )
+
+        return {
+            "task": self._cfg_value(
+                "move_to_eval.activity_name",
+                self._cfg_value("omni_config.task.activity_name", "N/A"),
+            ),
+            "prompt": prompt or "N/A",
+            "target_object": target_object or "N/A",
+            "target_distance": (
+                float(target_distance)
+                if isinstance(target_distance, numbers.Number)
+                else target_distance or "N/A"
+            ),
+            "success": bool(success) if success is not None else "N/A",
+        }
+
+    def _get_skill_chain_info_item(
+        self,
+        obs: Any,
+        infos: Optional[Any],
+        rewards: Optional[Any],
+        terminations: Optional[Any],
+        env_id: int,
+        time_idx: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Build the BEHAVIOR skill-chain overlay fields."""
+        model = self._get_obs_value(obs, "skill_chain_policy", env_id) or "N/A"
+        prompt = self._get_subtask_prompt(obs, env_id) or "N/A"
+        completed = self._get_obs_value(obs, "skill_chain_completed_count", env_id)
+        stage_count = self._get_obs_value(obs, "skill_chain_stage_count", env_id)
+        elapsed = self._get_obs_value(obs, "skill_chain_stage_elapsed", env_id)
+        limit = self._get_obs_value(obs, "skill_chain_stage_limit", env_id)
+
+        info_item: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "successful_tasks": (
+                f"{int(completed)}/{int(stage_count)}"
+                if completed is not None and stage_count is not None
+                else "N/A"
+            ),
+            "subtask_step": (
+                f"{int(elapsed)}/{int(limit)}"
+                if elapsed is not None and limit is not None
+                else "N/A"
+            ),
+        }
+
+        if rewards is not None:
+            value = self._value_for_env(rewards, env_id)
+            if time_idx is not None and isinstance(value, (np.ndarray, list, tuple)):
+                if len(value) > time_idx:
+                    value = value[time_idx]
+            info_item["reward"] = float(value) if value is not None else value
+
+        if terminations is not None:
+            value = self._value_for_env(terminations, env_id)
+            if time_idx is not None and isinstance(value, (np.ndarray, list, tuple)):
+                if len(value) > time_idx:
+                    value = value[time_idx]
+            info_item["termination"] = bool(value) if value is not None else value
+
+        failed = self._lookup_first_info_value(infos, ["episode.skill_chain_failed"], env_id)
+        done = self._lookup_first_info_value(infos, ["episode.skill_chain_done"], env_id)
+        skill_success = self._lookup_first_info_value(
+            infos, ["episode.skill_chain_skill_success"], env_id
+        )
+        radio_button_up = self._lookup_first_info_value(
+            infos, ["episode.radio_button_up"], env_id
+        )
+        radio_button_align = self._lookup_first_info_value(
+            infos, ["episode.radio_button_align"], env_id
+        )
+        if skill_success is not None:
+            info_item["skill_success"] = bool(skill_success)
+        if radio_button_up is not None:
+            info_item["radio_button_up"] = bool(radio_button_up)
+        if radio_button_align is not None:
+            info_item["radio_button_align"] = radio_button_align
+        if failed is not None:
+            info_item["chain_failed"] = bool(failed)
+        if done is not None:
+            info_item["chain_done"] = bool(done)
+        return info_item
 
     def _get_video_info_keys(self) -> list[str]:
         """Get configured info keys to overlay on video frames."""
@@ -357,6 +526,13 @@ class RecordVideo(gym.Wrapper):
         time_idx: Optional[int] = None,
     ) -> dict:
         """Build a per-env info dict for overlay."""
+        if self._is_skill_chain_eval():
+            return self._get_skill_chain_info_item(
+                obs, infos, rewards, terminations, env_id, time_idx
+            )
+        if self._is_move_to_eval():
+            return self._get_move_to_eval_info_item(obs, infos, env_id)
+
         info_item: dict[str, Any] = {}
 
         subtask_prompt = self._get_subtask_prompt(obs, env_id)
@@ -561,6 +737,15 @@ class RecordVideo(gym.Wrapper):
             if finalize:
                 self.video_cnt += 1
                 self._segment_cnt = 0
+            return
+        if (
+            finalize
+            and self._segment_cnt > 0
+            and len(self.render_images) < self._min_final_frames
+        ):
+            self.render_images = []
+            self.video_cnt += 1
+            self._segment_cnt = 0
             return
 
         output_dir = os.path.join(

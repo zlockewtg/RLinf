@@ -26,6 +26,7 @@ from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 
 from rlinf.models.embodiment.openpi.dataconfig import _CONFIGS_DICT
+from rlinf.models.embodiment.openpi.norm_stats import load_norm_stats
 
 
 def setup_logger(exp_name, log_dir):
@@ -95,7 +96,9 @@ def create_trained_policy(
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
+        norm_stats = load_norm_stats(
+            checkpoint_dir, data_config.asset_id, _checkpoints
+        )
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:

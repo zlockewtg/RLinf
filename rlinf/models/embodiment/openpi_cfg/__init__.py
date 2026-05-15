@@ -26,6 +26,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     from openpi.training import checkpoints as _checkpoints
 
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+    from rlinf.models.embodiment.openpi.norm_stats import load_norm_stats
     from rlinf.models.embodiment.openpi_cfg.openpi_cfg_action_model import (
         OpenPi0Config,
         OpenPi0ForCFGActionPrediction,
@@ -73,7 +74,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     )
     if data_config.asset_id is None:
         raise ValueError("Asset id is required to load norm stats.")
-    norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
+    norm_stats = load_norm_stats(checkpoint_dir, data_config.asset_id, _checkpoints)
 
     repack_transforms = transforms.Group()
     default_prompt = None

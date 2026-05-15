@@ -16,9 +16,11 @@ import gc
 import inspect
 import json
 import os
+import re
 import traceback
 from multiprocessing import get_context
 from threading import Thread
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
@@ -41,6 +43,564 @@ from rlinf.utils.logging import get_logger
 
 __all__ = ["BehaviorEnv"]
 
+MOVE_TO_EVAL_TASKS = {
+    "turning_on_radio": {
+        "task_id": 0,
+        "scene_model": "house_double_floor_lower",
+        "activity_instance_id": [1, 2, 3, 4, 5, 6, 7, 8],
+    },
+    "hanging_pictures": {
+        "task_id": 34,
+        "scene_model": "house_double_floor_lower",
+        "activity_instance_id": [2, 3, 4, 5, 6, 9, 10, 11],
+    },
+    "attach_a_camera_to_a_tripod": {
+        "task_id": 35,
+        "scene_model": "house_double_floor_upper",
+        "activity_instance_id": [1, 2, 3, 4, 5, 6, 7, 8],
+    },
+    "clean_a_trumpet": {
+        "task_id": 37,
+        "scene_model": "house_double_floor_upper",
+        "activity_instance_id": [1, 2, 3, 4, 5, 6, 7, 8],
+    },
+    "cook_cabbage": {
+        "task_id": 41,
+        "scene_model": "house_single_floor",
+        "activity_instance_id": [3, 4, 5, 6, 7, 8, 9, 10],
+    },
+    "chop_an_onion": {
+        "task_id": 42,
+        "scene_model": "house_double_floor_lower",
+        "activity_instance_id": [1, 2, 3, 4, 6, 8, 9, 10],
+    },
+    "cook_hot_dogs": {
+        "task_id": 45,
+        "scene_model": "house_single_floor",
+        "activity_instance_id": [1, 2, 3, 4, 5, 6, 7, 8],
+    },
+    "cook_bacon": {
+        "task_id": 46,
+        "scene_model": "house_single_floor",
+        "activity_instance_id": [1, 2, 3, 4, 5, 6, 7, 8],
+    },
+}
+
+
+def _normalize_object_text(text) -> str:
+    text = "" if text is None else str(text).lower().replace("_", " ")
+    text = re.sub(r"\.n\.\d+", " ", text)
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _unwrap_env(env):
+    while hasattr(env, "env"):
+        env = env.env
+    return env
+
+
+def _object_position(obj):
+    if obj is None:
+        return None
+    wrapped_obj = getattr(obj, "wrapped_obj", obj)
+    get_pose = getattr(wrapped_obj, "get_position_orientation", None)
+    if callable(get_pose):
+        return get_pose()[0]
+    get_pose = getattr(obj, "get_position_orientation", None)
+    if callable(get_pose):
+        return get_pose()[0]
+    states = getattr(obj, "states", None)
+    if states is not None:
+        try:
+            from omnigibson.object_states import Pose
+
+            return states[Pose].get_value()[0]
+        except Exception:
+            return None
+    return None
+
+
+def _robot_position(robot):
+    get_pose = getattr(robot, "get_position_orientation", None)
+    if callable(get_pose):
+        return get_pose()[0]
+    links = getattr(robot, "links", {})
+    for link_name in ("base_footprint_link", "base_link", "torso_lift_link"):
+        link = links.get(link_name) if isinstance(links, dict) else None
+        pos = _object_position(link)
+        if pos is not None:
+            return pos
+    return None
+
+
+def _robot_body_positions(robot) -> list:
+    if robot is None:
+        return []
+
+    positions = []
+    links = getattr(robot, "links", {})
+    for link_name in ("base_footprint_link", "base_link", "torso_lift_link"):
+        link = links.get(link_name) if isinstance(links, dict) else None
+        pos = _object_position(link)
+        if pos is not None:
+            positions.append(pos)
+
+    root_pos = _robot_position(robot)
+    if root_pos is not None:
+        positions.append(root_pos)
+    return positions
+
+
+def _robot_eef_positions(robot) -> list:
+    if robot is None:
+        return []
+
+    positions = []
+    arm_names = list(getattr(robot, "arm_names", []) or [])
+    default_arm = getattr(robot, "default_arm", None)
+    if default_arm is not None and default_arm not in arm_names:
+        arm_names.append(default_arm)
+
+    get_eef_position = getattr(robot, "get_eef_position", None)
+    if callable(get_eef_position):
+        for arm in arm_names or ["default"]:
+            try:
+                pos = get_eef_position(arm)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                continue
+            if pos is not None:
+                positions.append(pos)
+
+    eef_links = getattr(robot, "eef_links", {})
+    if isinstance(eef_links, dict):
+        for link in eef_links.values():
+            pos = _object_position(link)
+            if pos is not None:
+                positions.append(pos)
+    return positions
+
+
+def _min_distance_to_target(points: list, target_pos, axis_ids: list[int]) -> float:
+    distances = []
+    for point in points:
+        if point is None:
+            continue
+        point = torch.as_tensor(point, dtype=torch.float32)
+        target = torch.as_tensor(target_pos, dtype=torch.float32, device=point.device)
+        distances.append(torch.linalg.norm(point[axis_ids] - target[axis_ids]).item())
+    return min(distances) if distances else float("nan")
+
+
+def _find_distance_reward_target(env, target_name: str | None):
+    if not target_name:
+        return None
+    base_env = _unwrap_env(env)
+    task = getattr(base_env, "task", None)
+    target_norm = _normalize_object_text(target_name)
+    object_scope = getattr(task, "object_scope", {}) or {}
+    object_instance_to_category = getattr(task, "object_instance_to_category", {}) or {}
+
+    for bddl_inst, entity in object_scope.items():
+        if entity is None or getattr(entity, "is_system", False):
+            continue
+        names = [
+            bddl_inst,
+            getattr(entity, "name", None),
+            getattr(entity, "category", None),
+            getattr(entity, "bddl_inst", None),
+            object_instance_to_category.get(bddl_inst),
+        ]
+        normalized_names = [_normalize_object_text(name) for name in names if name]
+        if any(
+            name == target_norm
+            or name.startswith(f"{target_norm} ")
+            or target_norm in name.split()
+            for name in normalized_names
+        ):
+            return entity
+
+    scene = getattr(base_env, "scene", None)
+    object_registry = getattr(scene, "object_registry", None)
+    if callable(object_registry):
+        for key in ("name", "category"):
+            try:
+                obj = object_registry(key, target_name)
+            except Exception:
+                obj = None
+            if obj is not None:
+                return obj
+    return None
+
+
+def _distance_reward_for_env(env, cfg, target_override: str | None = None):
+    reward_cfg = OmegaConf.select(cfg, "distance_reward")
+    if reward_cfg is None or not bool(
+        OmegaConf.select(reward_cfg, "enabled", default=False)
+    ):
+        return None
+
+    configured_target = OmegaConf.select(reward_cfg, "target_object", default=None)
+    if configured_target is not None and str(configured_target).strip().lower() == "auto":
+        configured_target = None
+    target_name = target_override or configured_target
+    target = _find_distance_reward_target(env, target_name)
+    base_env = _unwrap_env(env)
+    robots = getattr(base_env, "robots", None) or getattr(
+        getattr(base_env, "scene", None), "robots", None
+    )
+    robot = robots[0] if robots else None
+    target_pos = _object_position(target)
+
+    info = {
+        "target_object": str(target_name) if target_name else "",
+        "target_object_found": target is not None,
+        "target_distance": float("nan"),
+        "body_target_distance": float("nan"),
+        "eef_target_distance": float("nan"),
+        "target_distance_source": "",
+        "distance_reward": 0.0,
+    }
+    if robot is None or target_pos is None:
+        return 0.0, info
+
+    axes = str(OmegaConf.select(reward_cfg, "distance_axes", default="xy")).lower()
+    axis_ids = [idx for idx, axis in enumerate("xyz") if axis in axes]
+    if not axis_ids:
+        axis_ids = [0, 1]
+
+    body_distance = _min_distance_to_target(
+        _robot_body_positions(robot), target_pos, axis_ids
+    )
+    eef_distance = _min_distance_to_target(
+        _robot_eef_positions(robot), target_pos, axis_ids
+    )
+    distance_candidates = [
+        ("body", body_distance),
+        ("eef", eef_distance),
+    ]
+    finite_candidates = [
+        (source, distance)
+        for source, distance in distance_candidates
+        if np.isfinite(distance)
+    ]
+    if not finite_candidates:
+        return 0.0, info
+    distance_source, distance = min(finite_candidates, key=lambda item: item[1])
+
+    scale = float(OmegaConf.select(reward_cfg, "scale", default=1.0))
+    reward = -distance * scale
+    success_threshold = OmegaConf.select(reward_cfg, "success_threshold", default=None)
+    if success_threshold is not None and distance <= float(success_threshold):
+        reward += float(OmegaConf.select(reward_cfg, "success_bonus", default=0.0))
+
+    info["target_distance"] = float(distance)
+    info["body_target_distance"] = float(body_distance)
+    info["eef_target_distance"] = float(eef_distance)
+    info["target_distance_source"] = distance_source
+    info["distance_reward"] = float(reward)
+    return reward, info
+
+
+def _apply_distance_rewards(cfg, env, rewards, infos, target_overrides=None):
+    if target_overrides is None:
+        target_overrides = [None] * len(env.envs)
+    reward_values = []
+    any_distance_reward = False
+    for child_env, raw_reward, info, target_override in zip(
+        env.envs, rewards, infos, target_overrides, strict=True
+    ):
+        result = _distance_reward_for_env(child_env, cfg, target_override)
+        if result is None:
+            reward_values.append(raw_reward)
+            continue
+        any_distance_reward = True
+        reward, reward_info = result
+        reward_values.append(reward)
+        if isinstance(info, dict):
+            reward_dict = info.setdefault("reward", {})
+            if isinstance(reward_dict, dict):
+                reward_dict["distance"] = reward_info
+
+    if not any_distance_reward:
+        return rewards, infos
+    return torch.as_tensor(reward_values, dtype=torch.float32), infos
+
+
+TURNING_ON_RADIO_STAGE_NAMES = (
+    "move_to_radio",
+    "pickup_from_support",
+    "press_radio",
+    "place_on_support",
+)
+
+
+def _float_value(value, default: float = float("nan")) -> float:
+    if value is None:
+        return default
+    try:
+        if torch.is_tensor(value):
+            value = value.detach().reshape(-1)[0].cpu().item()
+        return float(value)
+    except (RuntimeError, TypeError, ValueError, IndexError):
+        return default
+
+
+def _bool_value(value) -> bool:
+    if value is None:
+        return False
+    try:
+        if torch.is_tensor(value):
+            value = value.detach().reshape(-1)[0].cpu().item()
+        return bool(value)
+    except (RuntimeError, TypeError, ValueError, IndexError):
+        return False
+
+
+def _turning_on_radio_direct_stage_info(child_env, state: dict, active_stage_idx: int):
+    base_env = _unwrap_env(child_env)
+    task = getattr(base_env, "task", None)
+    if getattr(task, "activity_name", None) != "turning_on_radio":
+        return None
+
+    try:
+        from omnigibson.object_states.toggle import ToggledOn
+        from omnigibson.reward_functions.support_utils import (
+            get_min_eef_distance_to_obj,
+            get_min_eef_distance_to_toggle,
+            get_stage_objects_by_name,
+            is_supported_by_surface,
+            is_target_in_hand,
+        )
+        from omnigibson.reward_functions.turning_on_radio_reward import (
+            TurningOnRadioReward,
+        )
+    except Exception:
+        return None
+
+    stage_objects = state.get("stage_objects")
+    if stage_objects is None:
+        stage_objects = {
+            name: get_stage_objects_by_name(base_env, object_names)
+            for name, object_names in TurningOnRadioReward.STAGE_OBJECT_NAMES.items()
+        }
+        state["stage_objects"] = stage_objects
+    radio_objects = stage_objects.get("move_to_radio", [])
+    pickup_objects = stage_objects.get("pickup_from_support", [])
+    if not radio_objects:
+        return None
+    radio_obj = radio_objects[0]
+    support_obj = pickup_objects[1] if len(pickup_objects) > 1 else None
+    robots = getattr(base_env, "robots", None) or []
+    robot = robots[0] if robots else None
+    if robot is None:
+        return None
+
+    try:
+        toggle_state = radio_obj.states[ToggledOn]
+    except Exception:
+        toggle_state = None
+
+    radio_pos = _object_position(radio_obj)
+    initial_pos = state.get("radio_initial_pos")
+    if initial_pos is None and radio_pos is not None:
+        initial_pos = torch.as_tensor(radio_pos).detach().clone()
+        state["radio_initial_pos"] = initial_pos
+
+    try:
+        eef_to_obj_distance = _float_value(get_min_eef_distance_to_obj(robot, radio_obj))
+    except Exception:
+        eef_to_obj_distance = float("nan")
+    try:
+        in_hand = _bool_value(is_target_in_hand(robot, radio_obj))
+    except Exception:
+        in_hand = False
+    try:
+        on_support = _bool_value(is_supported_by_surface(radio_obj, support_obj))
+    except Exception:
+        on_support = False
+
+    has_left_support = bool(state.get("has_left_support", False)) or (not on_support)
+    has_picked_up = bool(state.get("has_picked_up", False)) or (
+        has_left_support and in_hand
+    )
+    state["has_left_support"] = has_left_support
+    state["has_picked_up"] = has_picked_up
+
+    radio_displacement = 0.0
+    if radio_pos is not None and initial_pos is not None:
+        try:
+            radio_displacement = _float_value(
+                torch.linalg.norm(torch.as_tensor(radio_pos) - torch.as_tensor(initial_pos)),
+                default=0.0,
+            )
+        except Exception:
+            radio_displacement = 0.0
+
+    toggle_steps = 0
+    toggled_on = False
+    eef_to_toggle_distance = float("nan")
+    if toggle_state is not None:
+        try:
+            toggled_on = _bool_value(toggle_state.get_value())
+        except Exception:
+            toggled_on = False
+        toggle_steps = int(getattr(toggle_state, "robot_can_toggle_steps", 0) or 0)
+        try:
+            eef_to_toggle_distance = _float_value(
+                get_min_eef_distance_to_toggle(robot, radio_obj, toggle_state)
+            )
+        except Exception:
+            eef_to_toggle_distance = float("nan")
+
+    active_stage_idx = max(
+        0, min(int(active_stage_idx), len(TURNING_ON_RADIO_STAGE_NAMES) - 1)
+    )
+    current_stage_name = TURNING_ON_RADIO_STAGE_NAMES[active_stage_idx]
+    stage_infos = {
+        "move_to_radio": {
+            "completed": active_stage_idx > 0,
+            "reward": 0.0,
+            "completion_bonus": 0.0,
+            "eef_to_obj_distance": eef_to_obj_distance,
+        },
+        "pickup_from_support": {
+            "completed": active_stage_idx > 1 or (
+                active_stage_idx == 1 and has_picked_up
+            ),
+            "reward": 0.0,
+            "completion_bonus": 0.0,
+            "eef_to_obj_distance": eef_to_obj_distance,
+            "in_hand": in_hand,
+            "on_support": on_support,
+            "has_left_support": has_left_support,
+            "has_picked_up": has_picked_up,
+            "radio_displacement_from_initial": radio_displacement,
+        },
+        "press_radio": {
+            "completed": active_stage_idx > 2 or (
+                active_stage_idx == 2 and toggled_on
+            ),
+            "reward": 0.0,
+            "completion_bonus": 0.0,
+            "eef_to_toggle_distance": eef_to_toggle_distance,
+            "toggle_steps": toggle_steps,
+        },
+        "place_on_support": {
+            "completed": active_stage_idx == 3 and on_support and not in_hand,
+            "reward": 0.0,
+            "completion_bonus": 0.0,
+            "eef_to_obj_distance": eef_to_obj_distance,
+            "in_hand": in_hand,
+            "on_support": on_support,
+        },
+    }
+    completed_stage_count = sum(
+        bool(stage_infos[name].get("completed", False))
+        for name in TURNING_ON_RADIO_STAGE_NAMES
+    )
+    return {
+        "current_stage_idx": active_stage_idx,
+        "current_stage_name": current_stage_name,
+        "completed_stage_count": completed_stage_count,
+        "total_stage_count": len(TURNING_ON_RADIO_STAGE_NAMES),
+        "all_stages_completed": completed_stage_count == len(TURNING_ON_RADIO_STAGE_NAMES),
+        "completion_bonus": 0.0,
+        "stage_infos": stage_infos,
+    }
+
+
+def _apply_direct_skill_chain_infos(env, infos, direct_states, active_stage_indices):
+    for env_idx, (child_env, info) in enumerate(
+        zip(env.envs, infos, strict=True)
+    ):
+        if not isinstance(info, dict):
+            continue
+        direct_info = _turning_on_radio_direct_stage_info(
+            child_env,
+            direct_states[env_idx],
+            active_stage_indices[env_idx],
+        )
+        if direct_info is None:
+            continue
+        reward_dict = info.setdefault("reward", {})
+        if isinstance(reward_dict, dict) and not any(
+            isinstance(payload, dict)
+            and ("stage_infos" in payload or "current_stage_name" in payload)
+            for payload in reward_dict.values()
+        ):
+            reward_dict["skill_chain_direct"] = direct_info
+    return infos
+
+
+def _apply_move_to_eval_preset(cfg: DictConfig) -> DictConfig:
+    move_to_cfg = OmegaConf.select(cfg, "move_to_eval")
+    if move_to_cfg is None or not bool(OmegaConf.select(move_to_cfg, "enabled", default=False)):
+        return cfg
+
+    activity_name = str(OmegaConf.select(move_to_cfg, "activity_name")).strip()
+    if activity_name not in MOVE_TO_EVAL_TASKS:
+        supported = ", ".join(sorted(MOVE_TO_EVAL_TASKS))
+        raise ValueError(
+            f"Unsupported move_to_eval.activity_name={activity_name!r}. "
+            f"Supported tasks: {supported}"
+        )
+
+    task_info = MOVE_TO_EVAL_TASKS[activity_name]
+    scene_model = task_info["scene_model"]
+    task_id = int(task_info["task_id"])
+    activity_definition_id = int(task_info.get("activity_definition_id", 0))
+    instance_ids = OmegaConf.select(move_to_cfg, "activity_instance_id", default=None)
+    if instance_ids is None:
+        instance_ids = list(task_info["activity_instance_id"])
+    else:
+        instance_ids = OmegaConf.to_container(instance_ids, resolve=True)
+    dataset_root = OmegaConf.select(
+        move_to_cfg,
+        "dataset_root",
+        default="/mnt/public/mjwei/download_models/2025-challenge-demos",
+    )
+    threshold = float(OmegaConf.select(move_to_cfg, "success_distance_threshold", default=0.8))
+
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    OmegaConf.update(cfg, "success_metric", "target_distance", force_add=True)
+    OmegaConf.update(cfg, "success_distance_threshold", threshold, force_add=True)
+    OmegaConf.update(cfg, "replay_init.enabled", True, force_add=True)
+    OmegaConf.update(cfg, "replay_init.dataset_root", dataset_root, force_add=True)
+    OmegaConf.update(cfg, "replay_init.task_id", task_id, force_add=True)
+    OmegaConf.update(cfg, "replay_init.skill_name", "move to", force_add=True)
+    OmegaConf.update(cfg, "replay_init.stage_boundary", "start", force_add=True)
+    OmegaConf.update(cfg, "distance_reward.enabled", True, force_add=True)
+    OmegaConf.update(cfg, "distance_reward.target_object", "auto", force_add=True)
+    OmegaConf.update(cfg, "distance_reward.distance_axes", "xy", force_add=True)
+    OmegaConf.update(cfg, "distance_reward.success_threshold", threshold, force_add=True)
+    OmegaConf.update(cfg, "distance_reward.success_bonus", 0.0, force_add=True)
+    OmegaConf.update(cfg, "omni_config.task.activity_name", activity_name, force_add=True)
+    OmegaConf.update(
+        cfg,
+        "omni_config.task.activity_definition_id",
+        activity_definition_id,
+        force_add=True,
+    )
+    OmegaConf.update(
+        cfg,
+        "omni_config.task.activity_instance_dir",
+        (
+            "${oc.env:OMNIGIBSON_DATA_PATH}/2025-challenge-task-instances/"
+            f"scenes/{scene_model}/json/{scene_model}_task_{activity_name}_instances"
+        ),
+        force_add=True,
+    )
+    OmegaConf.update(cfg, "omni_config.task.activity_instance_id", instance_ids, force_add=True)
+    OmegaConf.update(cfg, "omni_config.scene.scene_model", scene_model, force_add=True)
+    OmegaConf.update(cfg, "omni_config.task.reward_config.reward_mode", "potential", force_add=True)
+    OmegaConf.update(
+        cfg,
+        "omni_config.task.reward_config.task_specific_reward_name",
+        activity_name,
+        force_add=True,
+    )
+    return cfg
+
 
 def _behavior_env_worker(
     cfg: DictConfig, conn, num_envs: int, replay_seed_offset: int = 0
@@ -49,6 +609,7 @@ def _behavior_env_worker(
     try:
         from omnigibson.envs import VectorEnvironment
 
+        cfg = _apply_move_to_eval_preset(cfg)
         omni_cfg = setup_omni_cfg(cfg)
         instance_loader = ActivityInstanceLoader.from_omni_cfg(omni_cfg)
         replay_initializer = maybe_make_replay_initializer(
@@ -102,6 +663,50 @@ def _behavior_env_worker(
                 if hasattr(child_env, "_current_step"):
                     child_env._current_step = 0
 
+        direct_stage_states = []
+        direct_active_stage_indices = []
+
+        def _reset_direct_skill_chain_state():
+            direct_stage_states[:] = [{} for _ in getattr(env, "envs", [])]
+            direct_active_stage_indices[:] = [0 for _ in getattr(env, "envs", [])]
+
+        def _annotate_direct_skill_chain_infos(infos):
+            if not bool(OmegaConf.select(cfg, "skill_chain.enabled", default=False)):
+                return infos
+            return _apply_direct_skill_chain_infos(
+                env,
+                infos,
+                direct_stage_states,
+                direct_active_stage_indices,
+            )
+
+        def _set_active_stage_indices(stage_indices):
+            child_envs = getattr(env, "envs", [])
+            if not child_envs:
+                return
+            for env_idx, (child_env, stage_index) in enumerate(
+                zip(child_envs, stage_indices, strict=True)
+            ):
+                if stage_index is None:
+                    continue
+                if env_idx < len(direct_active_stage_indices):
+                    direct_active_stage_indices[env_idx] = int(stage_index)
+                task = getattr(_unwrap_env(child_env), "task", None)
+                reward_functions = getattr(task, "_reward_functions", {})
+                task_reward = (
+                    reward_functions.get("task_specific")
+                    if isinstance(reward_functions, dict)
+                    else None
+                )
+                set_stage = getattr(task_reward, "set_active_stage_index", None)
+                if callable(set_stage):
+                    set_stage(int(stage_index))
+
+        def _prime_replay_reward_stages(replay_plans):
+            _set_active_stage_indices(
+                [getattr(plan, "target_stage_index", None) for plan in replay_plans]
+            )
+
         def _annotate_replay_infos(infos, replay_infos):
             for info, replay_info in zip(infos, replay_infos, strict=True):
                 if isinstance(info, dict):
@@ -114,6 +719,7 @@ def _behavior_env_worker(
             max_steps = max(plan.replay_steps for plan in replay_plans)
             replay_infos = replay_plans_to_infos(replay_plans)
             if max_steps <= 0:
+                _prime_replay_reward_stages(replay_plans)
                 return raw_obs, _annotate_replay_infos(infos, replay_infos)
 
             action_dim = replay_plans[0].actions.shape[-1]
@@ -133,6 +739,7 @@ def _behavior_env_worker(
                 )
 
             _reset_replay_episode_counters()
+            _prime_replay_reward_stages(replay_plans)
             return raw_obs, _annotate_replay_infos(infos, replay_infos)
 
         conn.send(
@@ -141,6 +748,8 @@ def _behavior_env_worker(
                 "activity_name": instance_loader.activity_name,
             }
         )
+        distance_reward_targets = [None] * len(env.envs)
+        _reset_direct_skill_chain_state()
 
         while True:
             cmd, payload = conn.recv()
@@ -156,18 +765,38 @@ def _behavior_env_worker(
                     if replay_plans is not None
                     else None
                 )
+                distance_reward_targets = (
+                    [
+                        plan.target_object_id or plan.target_object_name
+                        for plan in replay_plans
+                    ]
+                    if replay_plans is not None
+                    else [None] * len(env.envs)
+                )
                 instance_loader.prepare_reset(
                     env,
                     instance_ids=replay_instance_ids,
                     group_size=group_size,
                 )
+                _reset_direct_skill_chain_state()
                 raw_obs, infos = env.reset()
                 if replay_plans is not None:
                     raw_obs, infos = _replay_after_reset(raw_obs, infos, replay_plans)
+                infos = _annotate_direct_skill_chain_infos(infos)
+                reset_rewards = torch.zeros(len(env.envs), dtype=torch.float32)
+                _, infos = _apply_distance_rewards(
+                    cfg, env, reset_rewards, infos, distance_reward_targets
+                )
                 conn.send({"type": "ok", "result": (raw_obs, infos)})
 
             elif cmd == "step":
                 result = env.step(payload)
+                raw_obs, rewards, terminations, truncations, infos = result
+                infos = _annotate_direct_skill_chain_infos(infos)
+                rewards, infos = _apply_distance_rewards(
+                    cfg, env, rewards, infos, distance_reward_targets
+                )
+                result = (raw_obs, rewards, terminations, truncations, infos)
                 conn.send({"type": "ok", "result": result})
 
             elif cmd == "chunk_step":
@@ -186,6 +815,10 @@ def _behavior_env_worker(
                     need_obs = not skip_intermediate_obs_in_chunk or is_last
                     raw_obs, step_rewards, terminations, truncations, infos = _step_env(
                         actions, need_obs=need_obs
+                    )
+                    infos = _annotate_direct_skill_chain_infos(infos)
+                    step_rewards, infos = _apply_distance_rewards(
+                        cfg, env, step_rewards, infos, distance_reward_targets
                     )
                     if not need_obs:
                         # Normalize intermediate-step observations to None so downstream
@@ -210,6 +843,10 @@ def _behavior_env_worker(
                         ),
                     }
                 )
+
+            elif cmd == "set_active_stage_indices":
+                _set_active_stage_indices(payload)
+                conn.send({"type": "ok", "result": None})
 
             elif cmd == "close":
                 env.close()
@@ -260,7 +897,130 @@ class BehaviorEnv(gym.Env):
         self.parent_conn_list = []
         self.child_conn_list = []
         self.use_subtask_prompt = bool(self.cfg.get("use_subtask_prompt", False))
+        self.subtask_prompt_override = self.cfg.get("subtask_prompt_override", None)
+        if self.subtask_prompt_override is not None:
+            self.subtask_prompt_override = str(self.subtask_prompt_override).strip()
+        self.subtask_prompt_only = bool(self.cfg.get("subtask_prompt_only", False))
+        move_to_eval_enabled = bool(
+            OmegaConf.select(self.cfg, "move_to_eval.enabled", default=False)
+        )
+        self.success_metric = str(self.cfg.get("success_metric", "env")).strip().lower()
+        if move_to_eval_enabled and self.success_metric == "env":
+            self.success_metric = "target_distance"
+        self.success_stage_name = self.cfg.get("success_stage_name", None)
+        if self.success_stage_name is not None:
+            self.success_stage_name = str(self.success_stage_name).strip()
+        self.success_distance_threshold = OmegaConf.select(
+            self.cfg, "move_to_eval.success_distance_threshold", default=None
+        )
+        if self.success_distance_threshold is None:
+            self.success_distance_threshold = self.cfg.get(
+                "success_distance_threshold",
+                OmegaConf.select(self.cfg, "distance_reward.success_threshold", default=None),
+            )
+        if self.success_distance_threshold is not None:
+            self.success_distance_threshold = float(self.success_distance_threshold)
         self._stage_prompt_lists: list[list[str] | None] = [None] * self.num_envs
+        self._current_stage_prompts: list[str | None] = [None] * self.num_envs
+        self.skill_chain_enabled = bool(
+            OmegaConf.select(self.cfg, "skill_chain.enabled", default=False)
+        )
+        self.skill_chain_move_to_threshold = float(
+            OmegaConf.select(
+                self.cfg,
+                "skill_chain.move_to_success_distance_threshold",
+                default=self.success_distance_threshold
+                if self.success_distance_threshold is not None
+                else 0.8,
+            )
+        )
+        self.skill_chain_max_steps_per_subtask = int(
+            OmegaConf.select(self.cfg, "skill_chain.max_steps_per_subtask", default=1024)
+        )
+        self.skill_chain_use_annotation_step_limits = bool(
+            OmegaConf.select(
+                self.cfg,
+                "skill_chain.use_annotation_step_limits",
+                default=False,
+            )
+        )
+        self.skill_chain_step_limits_by_skill = {}
+        step_limits_cfg = OmegaConf.select(
+            self.cfg,
+            "skill_chain.step_limits_by_skill",
+            default={},
+        )
+        if step_limits_cfg:
+            for key, value in OmegaConf.to_container(step_limits_cfg, resolve=True).items():
+                try:
+                    self.skill_chain_step_limits_by_skill[
+                        self._normalize_skill_text(key)
+                    ] = max(1, int(value))
+                except (TypeError, ValueError):
+                    continue
+        self.skill_chain_post_success_steps_by_skill = {}
+        post_success_steps_cfg = OmegaConf.select(
+            self.cfg,
+            "skill_chain.post_success_steps_by_skill",
+            default={},
+        )
+        if post_success_steps_cfg:
+            for key, value in OmegaConf.to_container(
+                post_success_steps_cfg, resolve=True
+            ).items():
+                try:
+                    self.skill_chain_post_success_steps_by_skill[
+                        self._normalize_skill_text(key)
+                    ] = max(0, int(value))
+                except (TypeError, ValueError):
+                    continue
+        self.skill_chain_prompts_by_skill = {}
+        prompts_cfg = OmegaConf.select(
+            self.cfg,
+            "skill_chain.prompts_by_skill",
+            default={},
+        )
+        if prompts_cfg:
+            for key, value in OmegaConf.to_container(prompts_cfg, resolve=True).items():
+                prompt = str(value).strip()
+                if prompt:
+                    self.skill_chain_prompts_by_skill[
+                        self._normalize_skill_text(key)
+                    ] = prompt
+        self.skill_chain_config_stage_names = self._string_list_from_cfg(
+            OmegaConf.select(self.cfg, "skill_chain.stage_names", default=None)
+        )
+        self.skill_chain_config_stage_prompts = self._string_list_from_cfg(
+            OmegaConf.select(self.cfg, "skill_chain.stage_prompts", default=None)
+        )
+        self.skill_chain_config_stage_limits = self._int_list_from_cfg(
+            OmegaConf.select(self.cfg, "skill_chain.stage_limits", default=None)
+        )
+        self.skill_chain_config_reward_stage_indices = self._int_list_from_cfg(
+            OmegaConf.select(self.cfg, "skill_chain.reward_stage_indices", default=None),
+            allow_none=True,
+        )
+        self.skill_chain_config_reward_stage_names = self._string_list_from_cfg(
+            OmegaConf.select(self.cfg, "skill_chain.reward_stage_names", default=None)
+        )
+        self._skill_chain_stage_names: list[list[str]] = [[] for _ in range(self.num_envs)]
+        self._skill_chain_stage_prompts: list[list[str]] = [[] for _ in range(self.num_envs)]
+        self._skill_chain_stage_limits: list[list[int]] = [[] for _ in range(self.num_envs)]
+        self._skill_chain_reward_stage_indices: list[list[int | None]] = [
+            [] for _ in range(self.num_envs)
+        ]
+        self._skill_chain_reward_stage_names: list[list[str | None]] = [
+            [] for _ in range(self.num_envs)
+        ]
+        self._skill_chain_stage_idx = [0 for _ in range(self.num_envs)]
+        self._skill_chain_stage_elapsed = [0 for _ in range(self.num_envs)]
+        self._skill_chain_completed: list[list[bool]] = [[] for _ in range(self.num_envs)]
+        self._skill_chain_failed = [False for _ in range(self.num_envs)]
+        self._skill_chain_done = [False for _ in range(self.num_envs)]
+        self._skill_chain_failed_stage = [-1 for _ in range(self.num_envs)]
+        self._skill_chain_terminal_reported = [False for _ in range(self.num_envs)]
+        self._skill_chain_pending_success = [False for _ in range(self.num_envs)]
+        self._skill_chain_post_success_remaining = [0 for _ in range(self.num_envs)]
 
         self.logger = get_logger()
 
@@ -356,6 +1116,291 @@ class BehaviorEnv(gym.Env):
             return parts
         tensors = [p if torch.is_tensor(p) else torch.as_tensor(p) for p in parts]
         return torch.cat(tensors, dim=0)
+
+    @staticmethod
+    def _list_from_cfg(value) -> list:
+        if value is None:
+            return []
+        if OmegaConf.is_config(value):
+            value = OmegaConf.to_container(value, resolve=True)
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    @classmethod
+    def _string_list_from_cfg(cls, value) -> list[str]:
+        return [
+            item
+            for item in (str(item).strip() for item in cls._list_from_cfg(value))
+            if item
+        ]
+
+    @classmethod
+    def _int_list_from_cfg(cls, value, allow_none: bool = False) -> list[int | None]:
+        parsed = []
+        for item in cls._list_from_cfg(value):
+            if item is None and allow_none:
+                parsed.append(None)
+                continue
+            try:
+                parsed.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return parsed
+
+    @staticmethod
+    def _normalize_skill_text(text: str | None) -> str:
+        text = "" if text is None else str(text).lower().replace("_", " ")
+        return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+    @staticmethod
+    def _metric_truthy(value, threshold: float = 0.5) -> bool | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return bool(value)
+        if not np.isfinite(numeric):
+            return None
+        return numeric >= threshold
+
+    def _pick_up_stage_success(self, stage_info: dict, fallback_completed: bool) -> bool:
+        metric_success = self._metric_truthy(stage_info.get("has_picked_up"))
+        if metric_success is not None:
+            return metric_success
+        completed = self._metric_truthy(stage_info.get("completed"))
+        if completed is not None:
+            return completed
+        return fallback_completed
+
+    def _reset_skill_chain_state(self, infos: list[dict] | None):
+        if not self.skill_chain_enabled:
+            return
+        infos = infos or [{} for _ in range(self.num_envs)]
+        for env_idx in range(self.num_envs):
+            info = infos[env_idx] if env_idx < len(infos) and isinstance(infos[env_idx], dict) else {}
+            replay_info = info.get("replay_init", {}) if isinstance(info, dict) else {}
+            if not isinstance(replay_info, dict):
+                replay_info = {}
+            names = [
+                str(name).strip()
+                for name in replay_info.get("replay_stage_skill_names", [])
+                if str(name).strip()
+            ]
+            if not names and self.skill_chain_config_stage_names:
+                names = list(self.skill_chain_config_stage_names)
+            reward_stage_indices = []
+            for value in replay_info.get("replay_stage_indices", []):
+                try:
+                    reward_stage_indices.append(int(value))
+                except (TypeError, ValueError):
+                    reward_stage_indices.append(None)
+            if not reward_stage_indices and self.skill_chain_config_reward_stage_indices:
+                reward_stage_indices = list(self.skill_chain_config_reward_stage_indices)
+            reward_stage_names = list(self.skill_chain_config_reward_stage_names)
+            prompts = [
+                str(prompt).strip()
+                for prompt in replay_info.get("replay_stage_prompts", [])
+                if str(prompt).strip()
+            ]
+            if not prompts and self.skill_chain_config_stage_prompts:
+                prompts = list(self.skill_chain_config_stage_prompts)
+            annotation_limits = []
+            for value in replay_info.get("replay_stage_step_limits", []):
+                try:
+                    annotation_limits.append(max(1, int(value)))
+                except (TypeError, ValueError):
+                    annotation_limits.append(1)
+            default_limit = max(1, int(self.skill_chain_max_steps_per_subtask))
+            if self.skill_chain_use_annotation_step_limits and annotation_limits:
+                limits = annotation_limits
+            elif self.skill_chain_config_stage_limits:
+                limits = [max(1, int(limit)) for limit in self.skill_chain_config_stage_limits]
+            else:
+                limits = [
+                    self.skill_chain_step_limits_by_skill.get(
+                        self._normalize_skill_text(name),
+                        default_limit,
+                    )
+                    for name in names
+                ]
+            if len(prompts) < len(names):
+                prompts.extend(names[len(prompts) :])
+            prompts = [
+                self.skill_chain_prompts_by_skill.get(
+                    self._normalize_skill_text(name),
+                    prompt,
+                )
+                for name, prompt in zip(names, prompts, strict=False)
+            ]
+            if len(limits) < len(names):
+                limits.extend(
+                    [
+                        self.skill_chain_step_limits_by_skill.get(
+                            self._normalize_skill_text(name),
+                            default_limit,
+                        )
+                        for name in names[len(limits) :]
+                    ]
+                )
+            if len(reward_stage_indices) < len(names):
+                reward_stage_indices.extend(
+                    range(len(reward_stage_indices), len(names))
+                )
+            if len(reward_stage_names) < len(names):
+                reward_stage_names.extend([None] * (len(names) - len(reward_stage_names)))
+
+            self._skill_chain_stage_names[env_idx] = names
+            self._skill_chain_stage_prompts[env_idx] = prompts[: len(names)]
+            self._skill_chain_stage_limits[env_idx] = limits[: len(names)]
+            self._skill_chain_reward_stage_indices[env_idx] = reward_stage_indices[
+                : len(names)
+            ]
+            self._skill_chain_reward_stage_names[env_idx] = reward_stage_names[
+                : len(names)
+            ]
+            self._skill_chain_stage_idx[env_idx] = 0
+            self._skill_chain_stage_elapsed[env_idx] = 0
+            self._skill_chain_completed[env_idx] = [False] * len(names)
+            self._skill_chain_failed[env_idx] = False
+            self._skill_chain_done[env_idx] = len(names) == 0
+            self._skill_chain_failed_stage[env_idx] = -1
+            self._skill_chain_terminal_reported[env_idx] = False
+            self._skill_chain_pending_success[env_idx] = False
+            self._skill_chain_post_success_remaining[env_idx] = 0
+
+    def _skill_chain_current_name(self, env_idx: int) -> str | None:
+        names = self._skill_chain_stage_names[env_idx]
+        idx = self._skill_chain_stage_idx[env_idx]
+        if idx < 0 or idx >= len(names):
+            return None
+        return names[idx]
+
+    def _skill_chain_current_prompt(self, env_idx: int) -> str | None:
+        prompts = self._skill_chain_stage_prompts[env_idx]
+        idx = self._skill_chain_stage_idx[env_idx]
+        if idx < 0 or idx >= len(prompts):
+            return self._skill_chain_current_name(env_idx)
+        return prompts[idx]
+
+    def _skill_chain_current_policy(self, env_idx: int) -> str:
+        if self._skill_chain_done[env_idx]:
+            return "__done__"
+        if self._skill_chain_failed[env_idx]:
+            return "__failed__"
+        return self._skill_chain_current_name(env_idx) or "__unknown__"
+
+    def _skill_chain_current_reward_stage_index(self, env_idx: int) -> int | None:
+        indices = self._skill_chain_reward_stage_indices[env_idx]
+        idx = self._skill_chain_stage_idx[env_idx]
+        if idx < 0 or idx >= len(indices):
+            return None
+        return indices[idx]
+
+    def _skill_chain_current_reward_stage_name(self, env_idx: int) -> str | None:
+        names = self._skill_chain_reward_stage_names[env_idx]
+        idx = self._skill_chain_stage_idx[env_idx]
+        if idx < 0 or idx >= len(names):
+            return None
+        return names[idx]
+
+    def _skill_name_to_reward_stage_name(self, skill_name: str | None) -> str | None:
+        normalized_name = self._normalize_skill_text(skill_name)
+        if normalized_name == "move to":
+            return "move_to_radio"
+        if normalized_name.startswith("pick up"):
+            return "pickup_from_support"
+        if normalized_name.startswith("press"):
+            return "press_radio"
+        if normalized_name.startswith("place on"):
+            return "place_on_support"
+        return None
+
+    def _skill_chain_current_post_success_steps(self, env_idx: int) -> int:
+        name = self._skill_chain_current_name(env_idx)
+        normalized_name = self._normalize_skill_text(name)
+        if normalized_name in self.skill_chain_post_success_steps_by_skill:
+            return int(self.skill_chain_post_success_steps_by_skill[normalized_name])
+        for configured_name, steps in self.skill_chain_post_success_steps_by_skill.items():
+            if normalized_name.startswith(configured_name) or configured_name.startswith(
+                normalized_name
+            ):
+                return int(steps)
+        return 0
+
+    def _sync_skill_chain_reward_stages(self):
+        if not self.skill_chain_enabled:
+            return
+        self._call_subproc(
+            "set_active_stage_indices",
+            [
+                self._skill_chain_current_reward_stage_index(env_idx)
+                for env_idx in range(self.num_envs)
+            ],
+        )
+
+    def _skill_chain_completed_count(self, env_idx: int) -> int:
+        return int(sum(bool(done) for done in self._skill_chain_completed[env_idx]))
+
+    def _skill_chain_prior_stage_completed(self, env_idx: int, prefix: str) -> bool:
+        target_prefix = self._normalize_skill_text(prefix)
+        current_idx = self._skill_chain_stage_idx[env_idx]
+        for idx, name in enumerate(self._skill_chain_stage_names[env_idx][:current_idx]):
+            if self._normalize_skill_text(name).startswith(target_prefix) and bool(
+                self._skill_chain_completed[env_idx][idx]
+            ):
+                return True
+        return False
+
+    def _skill_chain_new_terminal_tensor(self) -> torch.Tensor:
+        terminal = []
+        for env_idx, (done, failed) in enumerate(
+            zip(self._skill_chain_done, self._skill_chain_failed, strict=True)
+        ):
+            is_terminal = bool(done or failed)
+            report_terminal = is_terminal and not self._skill_chain_terminal_reported[env_idx]
+            terminal.append(report_terminal)
+            if report_terminal:
+                self._skill_chain_terminal_reported[env_idx] = True
+        return torch.tensor(terminal, dtype=torch.bool)
+
+    def _attach_skill_chain_obs_fields(self, obs: dict | None) -> dict | None:
+        if not self.skill_chain_enabled or obs is None:
+            return obs
+        obs["task_descriptions"] = [
+            self._compose_task_description(self._skill_chain_current_prompt(env_idx))
+            for env_idx in range(self.num_envs)
+        ]
+        obs["skill_chain_policy"] = [
+            self._skill_chain_current_policy(env_idx) for env_idx in range(self.num_envs)
+        ]
+        obs["skill_chain_completed_count"] = [
+            self._skill_chain_completed_count(env_idx) for env_idx in range(self.num_envs)
+        ]
+        obs["skill_chain_stage_idx"] = [
+            self._skill_chain_stage_idx[env_idx] for env_idx in range(self.num_envs)
+        ]
+        obs["skill_chain_stage_count"] = [
+            len(self._skill_chain_stage_names[env_idx]) for env_idx in range(self.num_envs)
+        ]
+        obs["skill_chain_stage_elapsed"] = [
+            self._skill_chain_stage_elapsed[env_idx] for env_idx in range(self.num_envs)
+        ]
+        obs["skill_chain_stage_limit"] = [
+            (
+                self._skill_chain_stage_limits[env_idx][self._skill_chain_stage_idx[env_idx]]
+                if self._skill_chain_stage_idx[env_idx]
+                < len(self._skill_chain_stage_limits[env_idx])
+                else 0
+            )
+            for env_idx in range(self.num_envs)
+        ]
+        obs["skill_chain_post_success_remaining"] = [
+            self._skill_chain_post_success_remaining[env_idx]
+            for env_idx in range(self.num_envs)
+        ]
+        return obs
 
     def _slice_actions_for_shards(self, actions):
         if actions is None:
@@ -478,6 +1523,13 @@ class BehaviorEnv(gym.Env):
             ]
             shard_results = self._call_all_subprocs("chunk_step", payloads)
             return self._merge_chunk_results(shard_results)
+        if cmd == "set_active_stage_indices":
+            payloads = [
+                payload[i * self.env_shard_size : (i + 1) * self.env_shard_size]
+                for i in range(n)
+            ]
+            self._call_all_subprocs("set_active_stage_indices", payloads)
+            return None
         if cmd == "close":
             self._call_all_subprocs("close", [None] * n)
             return None
@@ -510,7 +1562,7 @@ class BehaviorEnv(gym.Env):
 
     def _update_stage_prompts_from_info(self, env_idx: int, info: dict | None) -> str | None:
         if not isinstance(info, dict):
-            return None
+            return self._current_stage_prompts[env_idx]
 
         stage_info = info
         reward_info = info.get("reward")
@@ -521,6 +1573,11 @@ class BehaviorEnv(gym.Env):
 
         replay_info = info.get("replay_init")
         if isinstance(replay_info, dict):
+            replay_skill_prompt = replay_info.get("replay_skill_prompt")
+            if replay_skill_prompt:
+                prompt = str(replay_skill_prompt).strip()
+                self._current_stage_prompts[env_idx] = prompt
+                return prompt
             replay_prompts = replay_info.get("replay_stage_prompts")
             if isinstance(replay_prompts, (list, tuple)):
                 self._stage_prompt_lists[env_idx] = [
@@ -535,27 +1592,40 @@ class BehaviorEnv(gym.Env):
             or stage_info.get("subtask_prompt")
         )
         if explicit_prompt:
-            return str(explicit_prompt).strip()
+            prompt = str(explicit_prompt).strip()
+            self._current_stage_prompts[env_idx] = prompt
+            return prompt
 
         stage_idx = stage_info.get("current_stage_idx")
         if stage_idx is None:
-            return None
+            return self._current_stage_prompts[env_idx]
         try:
             stage_idx = int(stage_idx)
         except (TypeError, ValueError):
-            return None
+            return self._current_stage_prompts[env_idx]
 
         stage_prompts = self._stage_prompt_lists[env_idx]
         if not stage_prompts or stage_idx < 0 or stage_idx >= len(stage_prompts):
-            return None
-        return stage_prompts[stage_idx]
+            return self._current_stage_prompts[env_idx]
+        prompt = stage_prompts[stage_idx]
+        self._current_stage_prompts[env_idx] = prompt
+        return prompt
 
     def _compose_task_description(self, stage_prompt: str | None) -> str:
+        if self.subtask_prompt_override is not None:
+            return self.subtask_prompt_override
+        if self.subtask_prompt_only and stage_prompt:
+            return stage_prompt
         if not stage_prompt:
             return self.task_description
         return f"{self.task_description}\nCurrent stage: {stage_prompt}"
 
     def _task_descriptions_from_infos(self, infos=None) -> list[str]:
+        if self.skill_chain_enabled:
+            return [
+                self._compose_task_description(self._skill_chain_current_prompt(env_idx))
+                for env_idx in range(self.num_envs)
+            ]
         if not self.use_subtask_prompt or infos is None:
             return [self.task_description for _ in range(self.num_envs)]
         return [
@@ -583,10 +1653,12 @@ class BehaviorEnv(gym.Env):
                 [obs["state"] for obs in extracted_obs_list], axis=0
             ),  # [N_ENV, 32]
         }
-        return obs
+        return self._attach_skill_chain_obs_fields(obs)
 
     def reset(self):
         raw_obs, infos = self._call_subproc("reset")
+        self._reset_skill_chain_state(infos)
+        self._sync_skill_chain_reward_stages()
         obs = self._wrap_obs(raw_obs, infos)
         rewards = torch.zeros(self.num_envs, dtype=bool)
         infos = self._record_metrics(rewards, infos)
@@ -639,7 +1711,11 @@ class BehaviorEnv(gym.Env):
                 raw_rewards_list[i], raw_infos_list[i]
             )
             scaled_rewards_list.append(step_rewards)
-            infos = self._record_metrics(step_rewards, raw_infos_list[i])
+            infos = self._record_metrics(
+                step_rewards,
+                raw_infos_list[i],
+                allow_skill_chain_stage_transition=i == chunk_size - 1,
+            )
             if self.ignore_terminations:
                 raw_terminations_list[i] = torch.zeros_like(raw_terminations_list[i])
             raw_obs = raw_obs_list[i]
@@ -651,6 +1727,12 @@ class BehaviorEnv(gym.Env):
             else:
                 obs_list.append(self._wrap_obs(raw_obs, raw_infos_list[i]))
             infos_list.append(infos)
+            if self.skill_chain_enabled:
+                obs_list[-1] = self._attach_skill_chain_obs_fields(obs_list[-1])
+                raw_terminations_list[i] = torch.logical_or(
+                    raw_terminations_list[i].bool(),
+                    self._skill_chain_new_terminal_tensor(),
+                )
 
         chunk_rewards = torch.stack(scaled_rewards_list, dim=1)  # [num_envs, chunk_steps]
         raw_terminations = torch.stack(
@@ -725,6 +1807,9 @@ class BehaviorEnv(gym.Env):
         self.success_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self.success_step = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.int32
+        )
         self.returns = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.float32
         )
@@ -741,54 +1826,293 @@ class BehaviorEnv(gym.Env):
         self.prev_step_reward[mask] = 0.0
         if self.record_metrics:
             self.success_once[mask] = False
+            self.success_step[mask] = -1
             self.returns[mask] = 0
 
-    def _record_metrics(self, rewards, infos):
+    def _update_skill_chain_metrics(
+        self,
+        env_idx: int,
+        episode_length: int,
+        skill_success: bool,
+        allow_stage_transition: bool = True,
+    ) -> dict[str, Any]:
+        if not self.skill_chain_enabled:
+            return {}
+
+        names = self._skill_chain_stage_names[env_idx]
+        stage_count = len(names)
+        stage_changed = False
+        if stage_count == 0:
+            self._skill_chain_done[env_idx] = True
+        elif (
+            episode_length > 0
+            and not self._skill_chain_done[env_idx]
+            and not self._skill_chain_failed[env_idx]
+        ):
+            idx = self._skill_chain_stage_idx[env_idx]
+            success_just_detected = False
+            if skill_success and not self._skill_chain_pending_success[env_idx]:
+                self._skill_chain_pending_success[env_idx] = True
+                self._skill_chain_post_success_remaining[env_idx] = (
+                    self._skill_chain_current_post_success_steps(env_idx)
+                )
+                success_just_detected = True
+
+            if self._skill_chain_pending_success[env_idx] and not success_just_detected:
+                self._skill_chain_post_success_remaining[env_idx] = max(
+                    0,
+                    int(self._skill_chain_post_success_remaining[env_idx]) - 1,
+                )
+
+            if (
+                self._skill_chain_pending_success[env_idx]
+                and self._skill_chain_post_success_remaining[env_idx] <= 0
+                and allow_stage_transition
+            ):
+                self._skill_chain_completed[env_idx][idx] = True
+                self._skill_chain_pending_success[env_idx] = False
+                self._skill_chain_post_success_remaining[env_idx] = 0
+                if idx + 1 >= stage_count:
+                    self._skill_chain_done[env_idx] = True
+                else:
+                    self._skill_chain_stage_idx[env_idx] = idx + 1
+                    self._skill_chain_stage_elapsed[env_idx] = 0
+                    stage_changed = True
+            elif not self._skill_chain_pending_success[env_idx]:
+                self._skill_chain_stage_elapsed[env_idx] += 1
+                limit = self._skill_chain_stage_limits[env_idx][idx]
+                if self._skill_chain_stage_elapsed[env_idx] >= limit:
+                    self._skill_chain_failed[env_idx] = True
+                    self._skill_chain_failed_stage[env_idx] = idx
+            else:
+                self._skill_chain_stage_elapsed[env_idx] += 1
+
+        current_idx = self._skill_chain_stage_idx[env_idx]
+        chain_success = (
+            self._skill_chain_done[env_idx] and not self._skill_chain_failed[env_idx]
+        )
+        return {
+            "skill_chain_enabled": True,
+            "skill_chain_success": chain_success,
+            "skill_chain_failed": self._skill_chain_failed[env_idx],
+            "skill_chain_done": self._skill_chain_done[env_idx],
+            "skill_chain_stage_idx": current_idx,
+            "skill_chain_stage_count": stage_count,
+            "skill_chain_stage_elapsed": self._skill_chain_stage_elapsed[env_idx],
+            "skill_chain_stage_limit": (
+                self._skill_chain_stage_limits[env_idx][current_idx]
+                if current_idx < stage_count
+                else 0
+            ),
+            "skill_chain_completed_count": self._skill_chain_completed_count(env_idx),
+            "skill_chain_failed_stage": self._skill_chain_failed_stage[env_idx],
+            "skill_chain_post_success_remaining": self._skill_chain_post_success_remaining[
+                env_idx
+            ],
+            "skill_chain_stage_changed": stage_changed,
+        }
+
+    def _record_metrics(
+        self,
+        rewards,
+        infos,
+        allow_skill_chain_stage_transition: bool = True,
+    ):
         info_lists = []
         replay_info_lists = []
+        sync_reward_stage = False
         for env_idx, (reward, info) in enumerate(zip(rewards, infos)):
             task_reward = self._get_task_specific_reward_info(info)
+            distance_reward = self._get_distance_reward_info(info)
             completion_bonus = float(task_reward.get("completion_bonus", 0.0) or 0.0)
+            stage_infos = task_reward.get("stage_infos", {})
+            if not isinstance(stage_infos, dict):
+                stage_infos = {}
+            success_stage_info = self._get_success_stage_info(task_reward, stage_infos)
+            success_stage_completed = bool(success_stage_info.get("completed", False))
+            current_stage_name = task_reward.get("current_stage_name")
+            stage_info = stage_infos.get("press_radio", {})
+            if not isinstance(stage_info, dict) or (
+                "button_normal_up" not in stage_info and "button_up_alignment" not in stage_info
+            ):
+                current_stage_info = (
+                    stage_infos.get(current_stage_name, {}) if current_stage_name else {}
+                )
+                if (
+                    isinstance(current_stage_info, dict)
+                    and "press" in self._normalize_skill_text(current_stage_name)
+                    and (
+                        "button_normal_up" in current_stage_info
+                        or "button_up_alignment" in current_stage_info
+                    )
+                ):
+                    stage_info = current_stage_info
+            radio_button_up = None
+            radio_button_align = None
+            if isinstance(stage_info, dict):
+                button_normal_up = stage_info.get("button_normal_up")
+                button_up_alignment = stage_info.get("button_up_alignment")
+                if button_normal_up is not None:
+                    radio_button_up = self._metric_truthy(button_normal_up)
+                if button_up_alignment is not None:
+                    radio_button_align = float(button_up_alignment)
+                    if radio_button_up is None:
+                        radio_button_up = self._metric_truthy(radio_button_align)
+            target_distance = float(distance_reward.get("target_distance", float("nan")))
+            body_target_distance = float(
+                distance_reward.get("body_target_distance", float("nan"))
+            )
+            eef_target_distance = float(
+                distance_reward.get("eef_target_distance", float("nan"))
+            )
+            target_object_found = bool(distance_reward.get("target_object_found", False))
+            distance_success = (
+                self.success_distance_threshold is not None
+                and target_object_found
+                and np.isfinite(target_distance)
+                and target_distance <= self.success_distance_threshold
+            )
             done_dict = info.get("done", {})
             step_success = done_dict.get("success", False)
             end_success = info.get("success", step_success)
-            episode_length = info.get("episode_length", 0)
+            if self.success_metric in {"stage", "stage_completion"}:
+                step_success = success_stage_completed
+                end_success = success_stage_completed
+            elif self.success_metric in {"distance", "target_distance", "distance_threshold"}:
+                step_success = distance_success
+                end_success = distance_success
             current_stage_idx = task_reward.get("current_stage_idx", -1)
+            try:
+                current_stage_idx_int = int(current_stage_idx)
+            except (TypeError, ValueError):
+                current_stage_idx_int = -1
+            episode_length = info.get("episode_length", 0)
+            try:
+                episode_length_int = int(episode_length)
+            except (TypeError, ValueError):
+                episode_length_int = 0
+            skill_chain_info = {}
+            if self.skill_chain_enabled:
+                skill_name = self._skill_chain_current_name(env_idx)
+                normalized_skill_name = self._normalize_skill_text(skill_name)
+                expected_stage_idx = self._skill_chain_current_reward_stage_index(env_idx)
+                expected_stage_name = (
+                    self._skill_chain_current_reward_stage_name(env_idx)
+                    or self._skill_name_to_reward_stage_name(skill_name)
+                )
+                expected_stage_info = success_stage_info
+                if expected_stage_name:
+                    candidate_stage_info = stage_infos.get(expected_stage_name, {})
+                    if isinstance(candidate_stage_info, dict):
+                        expected_stage_info = candidate_stage_info
+                elif expected_stage_idx is not None:
+                    ordered_stage_infos = list(stage_infos.values())
+                    expected_stage_idx_int = int(expected_stage_idx)
+                    if 0 <= expected_stage_idx_int < len(ordered_stage_infos):
+                        candidate_stage_info = ordered_stage_infos[expected_stage_idx_int]
+                        if isinstance(candidate_stage_info, dict):
+                            expected_stage_info = candidate_stage_info
+                expected_stage_completed = bool(
+                    expected_stage_info.get("completed", False)
+                )
+                if expected_stage_name:
+                    active_expected_stage = (
+                        current_stage_name == expected_stage_name
+                        or expected_stage_completed
+                    )
+                else:
+                    active_expected_stage = (
+                        expected_stage_idx is None
+                        or current_stage_idx_int == int(expected_stage_idx)
+                        or expected_stage_completed
+                    )
+                if normalized_skill_name == "move to":
+                    skill_success = distance_success
+                elif normalized_skill_name.startswith("pick up"):
+                    skill_success = self._pick_up_stage_success(
+                        expected_stage_info,
+                        expected_stage_completed,
+                    )
+                elif normalized_skill_name.startswith("press"):
+                    skill_success = expected_stage_completed
+                elif normalized_skill_name.startswith("place on"):
+                    on_support = self._metric_truthy(expected_stage_info.get("on_support"))
+                    skill_success = (
+                        active_expected_stage
+                        and self._skill_chain_prior_stage_completed(env_idx, "press")
+                        and (on_support if on_support is not None else expected_stage_completed)
+                    )
+                else:
+                    skill_success = active_expected_stage and expected_stage_completed
+                skill_chain_info = self._update_skill_chain_metrics(
+                    env_idx,
+                    episode_length_int,
+                    bool(skill_success),
+                    allow_stage_transition=allow_skill_chain_stage_transition,
+                )
+                sync_reward_stage = sync_reward_stage or bool(
+                    skill_chain_info.get("skill_chain_stage_changed", False)
+                )
+                skill_chain_info["skill_chain_skill_success"] = bool(skill_success)
+                step_success = bool(skill_chain_info.get("skill_chain_success", False))
+                end_success = step_success
             total_stage_count = task_reward.get("total_stage_count", 0)
+            success_stage_in_hand = success_stage_info.get("in_hand", None)
+            success_stage_on_support = success_stage_info.get("on_support", None)
+            success_stage_distance = success_stage_info.get(
+                "eef_to_obj_distance",
+                success_stage_info.get(
+                    "eef_to_target_distance",
+                    success_stage_info.get("eef_to_container_distance", float("nan")),
+                ),
+            )
             episode_info = {
                 "episode_length": episode_length,
                 "completion_bonus": completion_bonus,
                 "current_stage_idx": int(current_stage_idx if current_stage_idx is not None else -1),
                 "total_stage_count": int(total_stage_count if total_stage_count is not None else 0),
+                "success_stage_completed": success_stage_completed,
+                "success_stage_in_hand": (
+                    float(success_stage_in_hand)
+                    if success_stage_in_hand is not None
+                    else float("nan")
+                ),
+                "success_stage_on_support": (
+                    float(success_stage_on_support)
+                    if success_stage_on_support is not None
+                    else float("nan")
+                ),
+                "success_stage_distance": float(success_stage_distance),
+                "success_stage_threshold": float(
+                    success_stage_info.get("success_threshold", float("nan"))
+                ),
+                "success_distance_threshold": float(
+                    self.success_distance_threshold
+                    if self.success_distance_threshold is not None
+                    else float("nan")
+                ),
                 "radio_button_up": False,
                 "radio_button_align": -1.0,
+                "target_distance": target_distance,
+                "body_target_distance": body_target_distance,
+                "eef_target_distance": eef_target_distance,
+                "distance_reward": float(
+                    distance_reward.get("distance_reward", 0.0)
+                ),
+                "target_object_found": target_object_found,
             }
-            stage_infos = task_reward.get("stage_infos", {})
-            if not isinstance(stage_infos, dict):
-                stage_infos = {}
-            current_stage_name = task_reward.get("current_stage_name")
-            stage_info = stage_infos.get(current_stage_name, {}) if current_stage_name else {}
-            if not isinstance(stage_info, dict) or (
-                "button_normal_up" not in stage_info and "button_up_alignment" not in stage_info
-            ):
-                for stage_name in ("pickup_from_support", "press_radio"):
-                    candidate = stage_infos.get(stage_name, {})
-                    if isinstance(candidate, dict) and (
-                        "button_normal_up" in candidate or "button_up_alignment" in candidate
-                    ):
-                        stage_info = candidate
-                        break
-
-            if isinstance(stage_info, dict):
-                button_normal_up = stage_info.get("button_normal_up")
-                button_up_alignment = stage_info.get("button_up_alignment")
-                if button_normal_up is not None:
-                    episode_info["radio_button_up"] = bool(button_normal_up)
-                if button_up_alignment is not None:
-                    episode_info["radio_button_align"] = float(button_up_alignment)
+            episode_info.update(skill_chain_info)
+            if radio_button_up is not None:
+                episode_info["radio_button_up"] = bool(radio_button_up)
+            if radio_button_align is not None:
+                episode_info["radio_button_align"] = float(radio_button_align)
             self.returns[env_idx] += reward
+            step_success_bool = bool(to_tensor(step_success).reshape(-1)[0].item())
+            if step_success_bool and not bool(self.success_once[env_idx].item()):
+                self.success_step[env_idx] = int(episode_length)
             self.success_once[env_idx] = self.success_once[env_idx] | step_success
             episode_info["success_once"] = self.success_once[env_idx].clone()
+            episode_info["success_step"] = self.success_step[env_idx].clone()
             episode_info["success_at_end"] = end_success
 
             episode_info["return"] = self.returns[env_idx].clone()
@@ -808,6 +2132,9 @@ class BehaviorEnv(gym.Env):
                     }
                 )
 
+        if sync_reward_stage:
+            self._sync_skill_chain_reward_stages()
+
         infos = {"episode": to_tensor(list_of_dict_to_dict_of_list(info_lists))}
         if replay_info_lists:
             infos["replay_init"] = to_tensor(
@@ -815,15 +2142,48 @@ class BehaviorEnv(gym.Env):
             )
         return infos
 
+    def _get_success_stage_info(self, task_reward: dict | None, stage_infos: dict) -> dict:
+        if self.success_stage_name:
+            stage_info = stage_infos.get(self.success_stage_name, {})
+            return stage_info if isinstance(stage_info, dict) else {}
+
+        current_stage_name = (
+            task_reward.get("current_stage_name") if isinstance(task_reward, dict) else None
+        )
+        stage_info = stage_infos.get(current_stage_name, {}) if current_stage_name else {}
+        return stage_info if isinstance(stage_info, dict) else {}
+
     @staticmethod
     def _get_task_specific_reward_info(info: dict | None) -> dict:
+        if not isinstance(info, dict):
+            return {}
+        if "stage_infos" in info or "current_stage_name" in info:
+            return info
+        reward_info = info.get("reward", {})
+        if not isinstance(reward_info, dict):
+            return {}
+        task_reward = reward_info.get("task_specific")
+        if isinstance(task_reward, dict) and (
+            "stage_infos" in task_reward or "current_stage_name" in task_reward
+        ):
+            return task_reward
+        for reward_payload in reward_info.values():
+            if isinstance(reward_payload, dict) and (
+                "stage_infos" in reward_payload
+                or "current_stage_name" in reward_payload
+            ):
+                return reward_payload
+        return {}
+
+    @staticmethod
+    def _get_distance_reward_info(info: dict | None) -> dict:
         if not isinstance(info, dict):
             return {}
         reward_info = info.get("reward", {})
         if not isinstance(reward_info, dict):
             return {}
-        task_reward = reward_info.get("task_specific", {})
-        return task_reward if isinstance(task_reward, dict) else {}
+        distance_reward = reward_info.get("distance", {})
+        return distance_reward if isinstance(distance_reward, dict) else {}
 
     @staticmethod
     def _extract_info_done(info: dict) -> bool:

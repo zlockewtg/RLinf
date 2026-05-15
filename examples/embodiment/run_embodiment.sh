@@ -13,15 +13,52 @@ export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
 # Only required when running the behavior experiment.
 export OMNIGIBSON_NO_OMNI_LOGS=${OMNIGIBSON_NO_OMNI_LOGS:-1}
 export OMNIGIBSON_DEBUG=${OMNIGIBSON_DEBUG:-0}
-export OMNIGIBSON_DATA_PATH=$OMNIGIBSON_DATA_PATH
+export OMNIGIBSON_DATA_PATH=/mnt/public/zhuchunyang_rl/hf_datasets/BEHAVIOR-1K-datasets-372
 export OMNIGIBSON_DATASET_PATH=${OMNIGIBSON_DATASET_PATH:-$OMNIGIBSON_DATA_PATH/behavior-1k-assets/}
 export OMNIGIBSON_KEY_PATH=${OMNIGIBSON_KEY_PATH:-$OMNIGIBSON_DATA_PATH/omnigibson.key}
 export OMNIGIBSON_ASSET_PATH=${OMNIGIBSON_ASSET_PATH:-$OMNIGIBSON_DATA_PATH/omnigibson-robot-assets/}
 export OMNIGIBSON_HEADLESS=${OMNIGIBSON_HEADLESS:-1}
 # Base path to Isaac Sim, only required when running the behavior experiment.
-export ISAAC_PATH=${ISAAC_PATH:-/path/to/isaac-sim}
+export ISAAC_PATH=${ISAAC_PATH:-/mnt/public/zhuchunyang_rl/sim_envs/isaac-sim}
 export EXP_PATH=${EXP_PATH:-$ISAAC_PATH/apps}
 export CARB_APP_PATH=${CARB_APP_PATH:-$ISAAC_PATH/kit}
+if [ -f "$ISAAC_PATH/setup_python_env.sh" ]; then
+    source "$ISAAC_PATH/setup_python_env.sh"
+    if [ -n "$VIRTUAL_ENV" ]; then
+        PYTHON_VERSION=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+        export PYTHONPATH="$VIRTUAL_ENV/lib/python${PYTHON_VERSION}/site-packages:$PYTHONPATH"
+    fi
+    export PYTHONPATH=$(python - <<'PY'
+import os
+
+paths = [p for p in os.environ.get("PYTHONPATH", "").split(":") if p]
+# Isaac Sim's bundled coverage package is incompatible with this venv's numba.
+paths = [p for p in paths if "extscache/omni.kit.pip_archive" not in p]
+isaac_python_lib = os.path.realpath(
+    os.path.join(os.environ.get("ISAAC_PATH", ""), "kit", "python", "lib")
+)
+
+
+def is_isaac_stdlib_path(path):
+    real_path = os.path.realpath(path)
+    try:
+        rel_path = os.path.relpath(real_path, isaac_python_lib)
+    except ValueError:
+        return False
+    parts = rel_path.split(os.sep)
+    if len(parts) < 1 or not parts[0].startswith("python"):
+        return False
+    return len(parts) == 1 or parts[1] == "lib-dynload"
+
+
+# Do not let the active conda/venv Python import Isaac Sim's bundled stdlib.
+paths = [p for p in paths if not is_isaac_stdlib_path(p)]
+print(":".join(paths))
+PY
+)
+else
+    echo "Warning: Isaac Sim setup script not found at $ISAAC_PATH/setup_python_env.sh"
+fi
 
 if [ -z "$1" ]; then
     CONFIG_NAME="maniskill_ppo_openvlaoft"
@@ -33,7 +70,7 @@ fi
 ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
 
 export ROBOT_PLATFORM
-
+export CUDA_LAUNCH_BLOCKING=1  # for debugging
 # Libero variant: standard, pro, plus
 export LIBERO_TYPE=${LIBERO_TYPE:-"standard"}
 if [ "$LIBERO_TYPE" == "pro" ]; then

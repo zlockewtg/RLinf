@@ -8,7 +8,9 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    rollout,env,actor: all
+    rollout: all
+    env: all
+    actor: all
 
 runner:
   logger:
@@ -18,6 +20,10 @@ runner:
 algorithm:
   eval_rollout_epoch: 2
   reward_coef: 2048
+
+rollout:
+  model:
+    model_path: /mnt/public/tgy/ckpts/pi05-turning_on_radio-sft-pytorch
 
 env:
   group_name: "EnvGroup"
@@ -64,5 +70,10 @@ env:
 
 actor:
   model:
+    model_path: ${rollout.model.model_path}
     openpi:
       noise_level: 0.0
+    openpi_data:
+      assets:
+        assets_dir: ${actor.model.model_path}
+        asset_id: assets/behavior-1k/2025-challenge-demos

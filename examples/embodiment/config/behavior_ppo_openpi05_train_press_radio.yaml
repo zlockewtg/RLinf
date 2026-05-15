@@ -1,0 +1,128 @@
+defaults:
+  - behavior_ppo_openpi_pi05
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    rollout:
+      placement: 0-1
+    actor:
+      placement: 0-1
+    env:
+      placement: 2-3
+
+runner:
+  logger:
+    experiment_name: "behavior_ppo_openpi05_train_press_radio"
+  max_epochs: 1000
+  max_steps: 1000
+  save_interval: 20
+
+algorithm:
+  rollout_epoch: 16
+  eval_rollout_epoch: 1
+  reward_coef: 1.0
+  filter_rewards: False
+  gamma: 0.99
+  gae_lambda: 0.95
+  sampling_params:
+    temperature_train: 0.6
+
+rollout:
+  sync_weight_load_instant: False
+  model:
+    model_path: /mnt/public/tgy/ckpts/skill_pool/pi05_b1k-press_skill/10800
+
+actor:
+  micro_batch_size: 4
+  global_batch_size: 512
+  optim:
+    lr: 5.0e-6
+    value_lr: 1.0e-4
+    clip_grad: 1.0
+  model:
+    model_path: ${rollout.model.model_path}
+    trainable_action_groups: ["arms"]
+    openpi:
+      noise_level: 0.3
+      value_after_vlm: True
+      ignore_last: True
+    openpi_data:
+      assets:
+        assets_dir: ${actor.model.model_path}
+        asset_id: assets/behavior-1k/2025-challenge-demos
+
+env:
+  train:
+    total_num_envs: 8
+    max_episode_steps: 2048
+    max_steps_per_rollout_epoch: 2048
+    reward_coef: ${algorithm.reward_coef}
+    num_env_subprocess: 2
+    use_subtask_prompt: True
+    subtask_prompt_override: press
+    skip_intermediate_obs_in_chunk: False
+    replay_init:
+      enabled: True
+      dataset_root: /mnt/public/mjwei/download_models/2025-challenge-demos
+      task_id: 0
+      skill_name: press
+      stage_boundary: start
+      replay_ratio: 1.0
+      jitter_steps: 0
+      noise_std: 0.0
+    omni_config:
+      env:
+        action_frequency: 30
+        physics_frequency: 120
+        rendering_frequency: 30
+      task:
+        activity_instance_dir: ${oc.env:OMNIGIBSON_DATA_PATH}/2025-challenge-task-instances/scenes/house_double_floor_lower/json/house_double_floor_lower_task_turning_on_radio_instances
+        activity_instance_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        instance_file_format: tro_state
+        instance_resample_mode: offline
+        online_object_sampling: False
+        use_presampled_robot_pose: True
+        reward_config:
+          reward_mode: stage
+          task_specific_reward_name: turning_on_radio
+
+  eval:
+    total_num_envs: 8
+    max_episode_steps: 2048
+    max_steps_per_rollout_epoch: 2048
+    use_subtask_prompt: True
+    subtask_prompt_override: press
+    skip_intermediate_obs_in_chunk: False
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    replay_init:
+      enabled: True
+      dataset_root: /mnt/public/mjwei/download_models/2025-challenge-demos
+      task_id: 0
+      skill_name: press
+      stage_boundary: start
+      replay_ratio: 1.0
+      jitter_steps: 0
+      noise_std: 0.0
+    omni_config:
+      env:
+        action_frequency: 30
+        physics_frequency: 120
+        rendering_frequency: 30
+      task:
+        activity_instance_dir: ${oc.env:OMNIGIBSON_DATA_PATH}/2025-challenge-task-instances/scenes/house_double_floor_lower/json/house_double_floor_lower_task_turning_on_radio_instances
+        activity_instance_id: [1, 2, 3, 4, 5, 6, 7, 8]
+        instance_file_format: tro_state
+        instance_resample_mode: offline
+        online_object_sampling: False
+        use_presampled_robot_pose: True
+        reward_config:
+          reward_mode: stage
+          task_specific_reward_name: turning_on_radio
