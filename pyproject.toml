@@ -37,6 +37,7 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "chex>=0.1.90",
 ]
 
 
@@ -60,12 +61,20 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+override-dependencies = [
+    "ml-dtypes==0.4.1",
+    "tensorstore==0.1.74",
+    "av>=14.0.0",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple/"
+default = true
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
-lerobot = { git = "https://github.com/huggingface/lerobot", rev = "577cd10974b84bea1f06b6472eb9e5e74e07f77a" }
-dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+lerobot = { git = "https://ghfast.top/https://github.com/huggingface/lerobot", rev = "577cd10974b84bea1f06b6472eb9e5e74e07f77a" }
+dlimp = { git = "https://ghfast.top/https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]
 members = ["packages/*"]

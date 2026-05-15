@@ -329,10 +329,12 @@ class PI0Pytorch(nn.Module):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
+
+        # Cast sequence embeddings to bf16 when the model config specifies bfloat16 computation.
+        # This matches JAX's Gemma module which casts embedded inputs to embed_dtype (gemma.py line 410).
+        # Note: adarms_cond is NOT cast here — it stays fp32 from time_mlp (matching JAX, where
+        # adarms_cond enters the Gemma module as fp32 and is cast inside the adaRMS Dense layer).
+        if self.config.dtype == "bfloat16":
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
@@ -344,6 +346,15 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        # Determine if mixed precision autocast is needed:
+        # When config.dtype is "bfloat16" but weights are fp32 (mixed precision mode),
+        # use autocast so Linear layers compute in bf16 with fp32 master weights —
+        # matching JAX's Linen Dense(dtype='bfloat16') behavior.
+        transformer_weight_dtype = (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        )
+        use_mixed_autocast = self.config.dtype == "bfloat16" and transformer_weight_dtype != torch.bfloat16
 
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
@@ -357,9 +368,18 @@ class PI0Pytorch(nn.Module):
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        if use_mixed_autocast:
+            # In mixed mode, call the transformer directly under autocast without the
+            # outer _apply_checkpoint. Memory is already saved by per-layer checkpointing
+            # inside gemma_pytorch.py. Wrapping autocast around _apply_checkpoint causes
+            # dtype mismatches during DDP backward when nested checkpoints recompute.
+            device_type = prefix_embs.device.type
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                suffix_out = forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond)
+        else:
+            suffix_out = self._apply_checkpoint(
+                forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)

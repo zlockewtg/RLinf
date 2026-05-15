@@ -134,6 +134,9 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     if data_config.skill_list != ["all"]:
         args["skill_list"] = data_config.skill_list
 
+    if data_config.skill_labels is not None:
+        args["skill_labels"] = data_config.skill_labels
+
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,

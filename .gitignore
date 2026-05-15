@@ -173,3 +173,9 @@ experiments/
 outputs
 
 log
+task0000_sft
+task0000_sft-oldjax
+task0000_sft_pytorch_mixed
+task0000_sft_pytorch_fp32
+task0000_sft_jax
+task0000_sft_skill

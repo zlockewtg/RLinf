@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -53,17 +54,28 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+
+    # Save wandb logs under the run's own directory
+    import os
+
+    wandb_dir = str(ckpt_dir)
+    os.environ["WANDB_DIR"] = wandb_dir
+
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, mode="offline", dir=wandb_dir)
     else:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
             group="openpi",
+            mode="offline",
+            dir=wandb_dir,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+
+    logging.info(f"Wandb offline logging to: {wandb_dir}")
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
@@ -259,12 +271,17 @@ def main(config: _config.TrainConfig):
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
+
+        # Per-step wandb logging
+        step_info = jax.device_get(info)
+        wandb.log({"loss": float(step_info["loss"]), "grad_norm": float(step_info["grad_norm"])}, step=step)
+
+        # Debug: log per-step loss
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
 

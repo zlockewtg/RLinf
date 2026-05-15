@@ -133,6 +133,11 @@ class DataConfig:
     # skill list to use for training
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
 
+    # skill-level annotation labels: mapping from skill_idx to prompt string.
+    # When set, replaces the task-level prompt with frame-aligned skill labels
+    # using frame_duration from annotations. Frames in gaps between skills are excluded.
+    skill_labels: dict[int, str] | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -514,7 +519,10 @@ class TrainConfig:
     pytorch_weight_path: str | None = None
 
     # Precision for PyTorch training.
-    pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+    # - "bfloat16": pure bf16 (params, optimizer states, activations all bf16)
+    # - "float32": pure fp32 (everything fp32)
+    # - "mixed": mixed precision matching JAX (fp32 master weights + optimizer states, bf16 transformer computation)
+    pytorch_training_precision: Literal["bfloat16", "float32", "mixed"] = "bfloat16"
 
     # Learning rate schedule to use for training.
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
@@ -801,7 +809,159 @@ _CONFIGS = [
         num_workers=8,
         batch_size=8 * 32,
     ),
-    # 4. Multi-dataset Training Configs
+    # 4. Custom SFT: task-0000 (turning_on_radio) with local data/model
+    TrainConfig(
+        name="pi05_b1k-task0000_sft_local",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/public/xzxuan/data/2025-challenge-demos",
+                tasks=["turning_on_radio"],
+                fine_grained_level=0,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/xzxuan/models/pi05_base/params"),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+        wandb_enabled=True,
+    ),
+    # 4b. PyTorch SFT (bf16): pure bfloat16 — params, optimizer states, activations all bf16
+    TrainConfig(
+        name="pi05_b1k-task0000_sft_local_pytorch_bf16",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/public/xzxuan/data/2025-challenge-demos",
+                tasks=["turning_on_radio"],
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="/mnt/public/xzxuan/models/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+        wandb_enabled=True,
+    ),
+    # 4c. PyTorch SFT (fp32): pure float32 — everything fp32
+    TrainConfig(
+        name="pi05_b1k-task0000_sft_local_pytorch_fp32",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/public/xzxuan/data/2025-challenge-demos",
+                tasks=["turning_on_radio"],
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="/mnt/public/xzxuan/models/pi05_base_pytorch",
+        pytorch_training_precision="float32",
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+        wandb_enabled=True,
+    ),
+    # 4d. PyTorch SFT (mixed): fp32 master weights + bf16 transformer computation (matches JAX)
+    TrainConfig(
+        name="pi05_b1k-task0000_sft_local_pytorch_mixed",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/public/xzxuan/data/2025-challenge-demos",
+                tasks=["turning_on_radio"],
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="/mnt/public/xzxuan/models/pi05_base_pytorch",
+        pytorch_training_precision="mixed",
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+        wandb_enabled=True,
+    ),
+    # 4e. Custom SFT: task-0000 with SKILL-LEVEL language labels
+    TrainConfig(
+        name="pi05_b1k-task0000_sft_local_skill",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="./outputs/assets/train/pi05_b1k-task0000_sft_local",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/public/xzxuan/data/2025-challenge-demos",
+                tasks=["turning_on_radio"],
+                fine_grained_level=0,
+                skill_labels={
+                    0: "move to radio",
+                    1: "pick up radio from coffee table",
+                    2: "press radio",
+                    3: "place radio on coffee table",
+                },
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/xzxuan/models/pi05_base/params"),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+        wandb_enabled=True,
+    ),
+    # 5. Multi-dataset Training Configs
     TrainConfig(
         name="pi05-b1k-demo0_6-comet0_4-step20k",
         exp_name="openpi",

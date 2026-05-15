@@ -70,7 +70,7 @@ def init_logging():
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
-    """Initialize wandb logging."""
+    """Initialize wandb logging in offline mode, saving under the run's checkpoint directory."""
     if not enabled:
         wandb.init(mode="disabled")
         return
@@ -79,16 +79,24 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
 
+    # Save wandb logs under the run's own directory
+    wandb_dir = str(ckpt_dir)
+    os.environ["WANDB_DIR"] = wandb_dir
+
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, mode="offline", dir=wandb_dir)
     else:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            mode="offline",
+            dir=wandb_dir,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+
+    logging.info(f"Wandb offline logging to: {wandb_dir}")
 
 
 def setup_ddp():
@@ -320,36 +328,42 @@ def train_loop(config: _config.TrainConfig):
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
 
-    # Initialize checkpoint directory and wandb
+    # Initialize checkpoint directory and wandb (only on main process to avoid race conditions)
     resuming = False
-    if config.resume:
-        # Find checkpoint directory based on experiment name
-        exp_checkpoint_dir = config.checkpoint_dir
-        if exp_checkpoint_dir.exists():
-            # Use validation to find the latest working checkpoint
-            latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
-            if latest_step is not None:
-                resuming = True
-                logging.info(
-                    f"Resuming from experiment checkpoint directory: {exp_checkpoint_dir} at step {latest_step}"
-                )
+    if is_main:
+        if config.resume:
+            exp_checkpoint_dir = config.checkpoint_dir
+            if exp_checkpoint_dir.exists():
+                latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
+                if latest_step is not None:
+                    resuming = True
+                    logging.info(
+                        f"Resuming from experiment checkpoint directory: {exp_checkpoint_dir} at step {latest_step}"
+                    )
+                else:
+                    raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
             else:
-                raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
-        else:
-            raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+                raise FileNotFoundError(
+                    f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume"
+                )
+        elif config.overwrite and config.checkpoint_dir.exists():
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
-    # Create checkpoint directory with experiment name
-    if not resuming:
-        # For new runs, create experiment-specific checkpoint directory
-        exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
-    else:
-        # For resume, checkpoint_dir is already set to the experiment directory
-        logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+        if not resuming:
+            exp_checkpoint_dir = config.checkpoint_dir
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        else:
+            logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+
+    # Synchronize all processes after checkpoint directory setup
+    if use_ddp:
+        # Broadcast resuming flag from rank 0 to all ranks
+        resuming_tensor = torch.tensor([int(resuming)], device=device)
+        dist.broadcast(resuming_tensor, src=0)
+        resuming = bool(resuming_tensor.item())
+        dist.barrier()
 
     # Initialize wandb (only on main process)
     if is_main:
@@ -399,10 +413,12 @@ def train_loop(config: _config.TrainConfig):
     #     logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
+    # For "mixed" mode, initialize the model as bfloat16 (same selective fp32 layers),
+    # then upcast to fp32 after loading weights. For other modes, use the precision directly.
+    model_dtype = "bfloat16" if config.pytorch_training_precision == "mixed" else config.pytorch_training_precision
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
-            dtype=config.pytorch_training_precision,
+            dtype=model_dtype,
             action_dim=config.model.action_dim,
             action_horizon=config.model.action_horizon,
             max_token_len=config.model.max_token_len,
@@ -412,8 +428,7 @@ def train_loop(config: _config.TrainConfig):
         )
     else:
         model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
-        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+        object.__setattr__(model_cfg, "dtype", model_dtype)
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
@@ -452,10 +467,15 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        safetensors.torch.load_model(model_to_load, model_path)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+
+        # Mixed precision: upcast all parameters to fp32 for master weights and fp32 optimizer states.
+        # The model's forward() will use autocast(bf16) for transformer computation.
+        if config.pytorch_training_precision == "mixed":
+            model_to_load.to(dtype=torch.float32)
+            logging.info("Mixed precision: upcast parameters to float32 (bf16 computation via autocast)")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -564,13 +584,20 @@ def train_loop(config: _config.TrainConfig):
                     param.grad.detach_()
                     param.grad = None
 
-            # Collect stats
+            # Per-step wandb logging
+            if is_main:
+                step_loss = loss.item()
+                step_lr = optim.param_groups[0]["lr"]
+                step_grad_norm = float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm
+                wandb.log({"loss": step_loss, "learning_rate": step_lr, "grad_norm": step_grad_norm}, step=global_step)
+
+            # Collect stats for console logging
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        "loss": step_loss,
+                        "learning_rate": step_lr,
+                        "grad_norm": step_grad_norm,
                     }
                 )
 
@@ -593,18 +620,6 @@ def train_loop(config: _config.TrainConfig):
                     if avg_grad_norm is not None
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
-
-                # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
-                    log_payload = {
-                        "loss": avg_loss,
-                        "learning_rate": avg_lr,
-                        "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
-                    }
-                    if avg_grad_norm is not None:
-                        log_payload["grad_norm"] = avg_grad_norm
-                    wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
                 infos = []  # Reset stats collection

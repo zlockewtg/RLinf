@@ -89,6 +89,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        skill_labels: dict[int, str] | None = None,
     ):
         """
         Custom args:
@@ -118,6 +119,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             train_rgb_type (str): type of rgb to use for training.
             return_seg_instance (bool): whether to return seg instance.
             skill_list (list[str]): ["all", "move_to:0.5"] etc.
+            skill_labels (dict[int, str] | None): mapping from skill_idx to prompt string.
+                When set, frames are labeled with skill-level prompts instead of task-level.
+                Frames in gaps between skill ranges are excluded from training.
         """
         Dataset.__init__(self)
         self.repo_id = repo_id
@@ -133,6 +137,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self.skill_labels = skill_labels
 
         # Unused attributes
         self.image_writer = None
@@ -145,7 +150,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if modalities is None:
             modalities = ["rgb", "depth", "seg_instance_id"]
         if "seg_instance_id" in modalities:
-            assert chunk_streaming_using_keyframe, "For the sake of data loading speed, please use chunk_streaming_using_keyframe=True when loading segmentation instance ID videos."
+            assert chunk_streaming_using_keyframe, (
+                "For the sake of data loading speed, please use chunk_streaming_using_keyframe=True when loading segmentation instance ID videos."
+            )
         if "depth" in modalities:
             assert self.video_backend == "pyav", (
                 "Depth videos can only be decoded with the 'pyav' backend. "
@@ -235,6 +242,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         self.prepare_task(fine_grained_level)
 
+        if self.skill_labels is not None:
+            self._build_skill_boundaries()
+
         self.omnigibson_mapping = {ep_idx: defaultdict(dict) for ep_idx in self.episodes}
 
     def prepare_task(self, fine_grained_level: int):
@@ -250,6 +260,36 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             print(f"[warn] {self.repo_id} failed to calculate episode subtask cumulate: {e}")
 
         print(f"prepare task with fine_grained_level {self.fine_grained_level} for {self.root}")
+
+    def _build_skill_boundaries(self):
+        """Build per-episode skill boundary lookup from annotations for skill-level prompts."""
+        self.skill_start_frames = {}
+        self.skill_end_frames = {}
+        for ep_id in self.episodes:
+            if ep_id not in self.meta.annotations:
+                continue
+            skills = sorted(self.meta.annotations[ep_id]["skill_annotation"], key=lambda s: s["skill_idx"])
+            self.skill_start_frames[ep_id] = [s["frame_duration"][0] for s in skills]
+            self.skill_end_frames[ep_id] = [s["frame_duration"][1] for s in skills]
+
+    def _is_gap_frame(self, ep_idx: int, frame_index: int) -> bool:
+        """Return True if frame_index falls in a gap between skill ranges."""
+        start_frames = self.skill_start_frames[ep_idx]
+        end_frames = self.skill_end_frames[ep_idx]
+        skill_idx = bisect.bisect_right(start_frames, frame_index) - 1
+        if skill_idx < 0:
+            return True
+        skill_idx = min(skill_idx, len(start_frames) - 1)
+        return frame_index >= end_frames[skill_idx]
+
+    def _get_skill_label(self, item: dict) -> str:
+        """Resolve the current frame to a skill-level label using annotations."""
+        ep_idx = item["episode_index"].item()
+        frame_index = round(item["timestamp"].item() * self.fps)
+        start_frames = self.skill_start_frames[ep_idx]
+        skill_idx = bisect.bisect_right(start_frames, frame_index) - 1
+        skill_idx = max(0, min(skill_idx, len(start_frames) - 1))
+        return self.skill_labels[skill_idx]
 
     def get_episodes_file_paths(self) -> list[str]:
         """
@@ -423,6 +463,16 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 next(self.obs_loaders[key])[0]
             return self.__getitem__(idx)
 
+        # skip frames that fall in gaps between skill ranges
+        if self.skill_labels is not None:
+            ep_idx_val = item["episode_index"].item()
+            frame_index_val = round(item["timestamp"].item() * self.fps)
+            if self._is_gap_frame(ep_idx_val, frame_index_val):
+                self.current_streaming_frame_idx += 1
+                for key in self.meta.video_keys:
+                    next(self.obs_loaders[key])[0]
+                return self.__getitem__(idx)
+
         # load visual observations
         for key in self.meta.video_keys:
             item[key] = next(self.obs_loaders[key])[0]
@@ -465,6 +515,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         return task_skill
 
     def _get_fine_grained_task(self, item: dict) -> str:
+        if self.skill_labels is not None:
+            return self._get_skill_label(item)
         ep_idx = item["episode_index"].item()
         task_idx = item["task_index"].item()
         frame_index = round(item["timestamp"].item() * self.fps)
@@ -551,12 +603,12 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
         self.task_name_candidates = set(tasks) if tasks is not None else set(TASK_NAMES_TO_INDICES.keys())
         self.modalities = set(modalities)
         self.camera_names = set(cameras)
-        assert self.modalities.issubset(
-            {"rgb", "depth", "seg_instance_id"}
-        ), f"Modalities must be a subset of ['rgb', 'depth', 'seg_instance_id'], but got {self.modalities}"
-        assert self.camera_names.issubset(
-            ROBOT_CAMERA_NAMES["R1Pro"]
-        ), f"Camera names must be a subset of {ROBOT_CAMERA_NAMES['R1Pro']}, but got {self.camera_names}"
+        assert self.modalities.issubset({"rgb", "depth", "seg_instance_id"}), (
+            f"Modalities must be a subset of ['rgb', 'depth', 'seg_instance_id'], but got {self.modalities}"
+        )
+        assert self.camera_names.issubset(ROBOT_CAMERA_NAMES["R1Pro"]), (
+            f"Camera names must be a subset of {ROBOT_CAMERA_NAMES['R1Pro']}, but got {self.camera_names}"
+        )
         # ===================================
 
         self.repo_id = repo_id
