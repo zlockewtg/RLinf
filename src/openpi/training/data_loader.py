@@ -136,6 +136,9 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
 
     if data_config.skill_labels is not None:
         args["skill_labels"] = data_config.skill_labels
+        args["enable_gap"] = data_config.enable_gap
+        args["allow_left"] = data_config.allow_left
+        args["allow_right"] = data_config.allow_right
 
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,

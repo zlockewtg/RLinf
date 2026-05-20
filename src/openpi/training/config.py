@@ -138,6 +138,15 @@ class DataConfig:
     # using frame_duration from annotations. Frames in gaps between skills are excluded.
     skill_labels: dict[int, str] | None = None
 
+    # Whether to include gap frames between skills in training.
+    # Gap frames are shared by both adjacent skills (randomly assigned per sample).
+    enable_gap: bool = False
+
+    # Extend skill boundaries left/right at contiguous (no-gap) boundaries.
+    # Creates overlap zones that are randomly assigned to either adjacent skill.
+    allow_left: int = 0
+    allow_right: int = 0
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -946,6 +955,9 @@ _CONFIGS = [
                     2: "press radio",
                     3: "place radio on coffee table",
                 },
+                enable_gap=True,
+                allow_left=100,
+                allow_right=100,
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/xzxuan/models/pi05_base/params"),

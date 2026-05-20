@@ -90,6 +90,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
         skill_labels: dict[int, str] | None = None,
+        enable_gap: bool = False,
+        allow_left: int = 0,
+        allow_right: int = 0,
     ):
         """
         Custom args:
@@ -121,7 +124,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             skill_list (list[str]): ["all", "move_to:0.5"] etc.
             skill_labels (dict[int, str] | None): mapping from skill_idx to prompt string.
                 When set, frames are labeled with skill-level prompts instead of task-level.
-                Frames in gaps between skill ranges are excluded from training.
+            enable_gap (bool): include gap frames between skills, shared by both adjacent skills.
+            allow_left (int): extend skill start backward at contiguous boundaries.
+            allow_right (int): extend skill end forward at contiguous boundaries.
         """
         Dataset.__init__(self)
         self.repo_id = repo_id
@@ -138,6 +143,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
         self.skill_labels = skill_labels
+        self.enable_gap = enable_gap
+        self.allow_left = allow_left
+        self.allow_right = allow_right
 
         # Unused attributes
         self.image_writer = None
@@ -245,6 +253,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if self.skill_labels is not None:
             self._build_skill_boundaries()
 
+        # Seed Python random for reproducible skill label assignment in overlap zones
+        random.seed(self.seed)
+
         self.omnigibson_mapping = {ep_idx: defaultdict(dict) for ep_idx in self.episodes}
 
     def prepare_task(self, fine_grained_level: int):
@@ -262,34 +273,79 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         print(f"prepare task with fine_grained_level {self.fine_grained_level} for {self.root}")
 
     def _build_skill_boundaries(self):
-        """Build per-episode skill boundary lookup from annotations for skill-level prompts."""
+        """Build per-episode skill boundary lookup from annotations.
+
+        Each side of a skill's frame_duration is handled independently:
+          - gap on this side  → controlled by enable_gap
+          - no gap (contiguous or no neighbour) → controlled by allow_left / allow_right
+        A single skill can have different logic on its left vs right side.
+        """
         self.skill_start_frames = {}
         self.skill_end_frames = {}
         for ep_id in self.episodes:
             if ep_id not in self.meta.annotations:
                 continue
             skills = sorted(self.meta.annotations[ep_id]["skill_annotation"], key=lambda s: s["skill_idx"])
-            self.skill_start_frames[ep_id] = [s["frame_duration"][0] for s in skills]
-            self.skill_end_frames[ep_id] = [s["frame_duration"][1] for s in skills]
+            starts = [s["frame_duration"][0] for s in skills]
+            ends = [s["frame_duration"][1] for s in skills]
+            valid = self.meta.annotations[ep_id]["meta_data"]["valid_duration"]
+            n = len(skills)
+            eff_s, eff_e = list(starts), list(ends)
+
+            for i in range(n):
+                # --- Left side ---
+                if i > 0 and ends[i - 1] < starts[i]:
+                    # gap to the left → enable_gap controls
+                    if self.enable_gap:
+                        eff_s[i] = ends[i - 1]
+                else:
+                    # no gap (contiguous or first skill) → allow_left controls
+                    eff_s[i] = starts[i] - self.allow_left
+
+                # --- Right side ---
+                if i < n - 1 and ends[i] < starts[i + 1]:
+                    # gap to the right → enable_gap controls
+                    if self.enable_gap:
+                        eff_e[i] = starts[i + 1]
+                else:
+                    # no gap (contiguous or last skill) → allow_right controls
+                    eff_e[i] = ends[i] + self.allow_right
+
+                # Clamp to valid frame range
+                eff_s[i] = max(eff_s[i], valid[0])
+                eff_e[i] = min(eff_e[i], valid[1])
+
+            self.skill_start_frames[ep_id] = eff_s
+            self.skill_end_frames[ep_id] = eff_e
 
     def _is_gap_frame(self, ep_idx: int, frame_index: int) -> bool:
-        """Return True if frame_index falls in a gap between skill ranges."""
-        start_frames = self.skill_start_frames[ep_idx]
-        end_frames = self.skill_end_frames[ep_idx]
-        skill_idx = bisect.bisect_right(start_frames, frame_index) - 1
-        if skill_idx < 0:
-            return True
-        skill_idx = min(skill_idx, len(start_frames) - 1)
-        return frame_index >= end_frames[skill_idx]
+        """Return True if frame_index is not within any skill's (possibly extended) range."""
+        starts = self.skill_start_frames[ep_idx]
+        ends = self.skill_end_frames[ep_idx]
+        for i in range(len(starts)):
+            if starts[i] <= frame_index < ends[i]:
+                return False
+        return True
 
     def _get_skill_label(self, item: dict) -> str:
-        """Resolve the current frame to a skill-level label using annotations."""
+        """Resolve the current frame to a skill-level label.
+
+        When augmentation creates overlapping ranges, the frame may belong to
+        multiple skills — one is chosen at random so that over training both
+        adjacent skills are represented.
+        """
         ep_idx = item["episode_index"].item()
         frame_index = round(item["timestamp"].item() * self.fps)
-        start_frames = self.skill_start_frames[ep_idx]
-        skill_idx = bisect.bisect_right(start_frames, frame_index) - 1
-        skill_idx = max(0, min(skill_idx, len(start_frames) - 1))
-        return self.skill_labels[skill_idx]
+        starts = self.skill_start_frames[ep_idx]
+        ends = self.skill_end_frames[ep_idx]
+        candidates = [i for i in range(len(starts)) if starts[i] <= frame_index < ends[i]]
+        if len(candidates) == 1:
+            return self.skill_labels[candidates[0]]
+        if len(candidates) > 1:
+            return self.skill_labels[random.choice(candidates)]
+        # fallback — shouldn't happen if _is_gap_frame works correctly
+        skill_idx = bisect.bisect_right(starts, frame_index) - 1
+        return self.skill_labels[max(0, skill_idx)]
 
     def get_episodes_file_paths(self) -> list[str]:
         """
