@@ -1,5 +1,4 @@
 from collections import deque
-import copy
 import json
 import logging
 
@@ -23,6 +22,18 @@ The skills are:
 
 What's the next skill to perform? Only respond with a single skill name.
 """
+
+
+def _copy_policy_batch(input_obs: dict) -> dict:
+    batch = {}
+    for key, value in input_obs.items():
+        if isinstance(value, np.ndarray):
+            batch[key] = value.copy()
+        elif torch.is_tensor(value):
+            batch[key] = value.clone()
+        else:
+            batch[key] = value
+    return batch
 
 
 class B1KPolicyWrapper:
@@ -138,7 +149,7 @@ class B1KPolicyWrapper:
     def act_receeding_temporal(self, input_obs):
         # Step 1: check if we should re-run policy
         if self.step_counter % self.replan_interval == 0:
-            nbatch = copy.deepcopy(input_obs)
+            nbatch = _copy_policy_batch(input_obs)
             if nbatch["observation"].shape[-1] != 3:
                 # make B, num_cameras, H, W, C  from B, num_cameras, C, H, W
                 # permute if pytorch
@@ -252,7 +263,7 @@ class B1KPolicyWrapper:
                 final_action = self.action_queue.popleft()[None]
                 return torch.from_numpy(final_action)
 
-        nbatch = copy.deepcopy(input_obs)
+        nbatch = _copy_policy_batch(input_obs)
         if nbatch["observation"].shape[-1] != 3:
             # make B, num_cameras, H, W, C  from B, num_cameras, C, H, W
             # permute if pytorch

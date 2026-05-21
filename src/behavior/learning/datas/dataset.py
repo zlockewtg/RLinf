@@ -155,6 +155,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # ========== Customizations ==========
         self.seed = seed
+        self.shuffle = shuffle
         if modalities is None:
             modalities = ["rgb", "depth", "seg_instance_id"]
         if "seg_instance_id" in modalities:
@@ -249,6 +250,16 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
         self.prepare_task(fine_grained_level)
+        self._active_chunks = None
+        if self._chunk_streaming_using_keyframe:
+            skill_filtered_chunks = self._get_skill_filtered_chunk_indices()
+            if skill_filtered_chunks is not None:
+                self.chunks = skill_filtered_chunks
+                if len(self.chunks) == 0:
+                    raise ValueError(f"No frames matched skill filter {self.skill_list} for dataset {self.repo_id}.")
+                if self.current_streaming_chunk_idx is not None:
+                    self.current_streaming_chunk_idx = 0
+                    self.current_streaming_frame_idx = self.chunks[0][0]
 
         if self.skill_labels is not None:
             self._build_skill_boundaries()
@@ -271,6 +282,58 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             print(f"[warn] {self.repo_id} failed to calculate episode subtask cumulate: {e}")
 
         print(f"prepare task with fine_grained_level {self.fine_grained_level} for {self.root}")
+
+    def _has_deterministic_skill_filter(self) -> bool:
+        if self.skill_list is None:
+            return False
+        filtered_skills = [skill_item for skill_item in self.skill_list if skill_item != "all"]
+        if not filtered_skills:
+            return False
+        try:
+            return all(float(skill_item.split(":")[1]) in (0.0, 1.0) for skill_item in filtered_skills)
+        except (IndexError, ValueError):
+            return False
+
+    def _get_skill_filtered_chunk_indices(self, chunk_size=250) -> list[tuple[int, int, int]] | None:
+        if not self._has_deterministic_skill_filter():
+            return None
+
+        filtered_chunks = []
+        for ep_idx in self.episodes:
+            if ep_idx not in self.task_sizes or ep_idx not in self.meta.orchestrators:
+                return None
+
+            ep_pos = self.episode_data_index_pos[ep_idx]
+            ep_start = int(self.episode_data_index["from"][ep_pos].item())
+            ep_end = int(self.episode_data_index["to"][ep_pos].item())
+            episode_len = ep_end - ep_start
+
+            local_start = 0
+            for sub_idx, local_end_inclusive in enumerate(self.task_sizes[ep_idx]):
+                local_end = min(int(local_end_inclusive) + 1, episode_len)
+                if local_end <= local_start:
+                    continue
+
+                orch = self.meta.orchestrators[ep_idx][1][sub_idx]
+                task_skill = orch.get("skill", orch["task"])
+                weight = skill_weight(task_skill, self.skill_list)
+                if weight not in (0.0, 1.0):
+                    return None
+
+                if weight == 1.0:
+                    for chunk_local_start in range(local_start, local_end, chunk_size):
+                        chunk_local_end = min(chunk_local_start + chunk_size, local_end)
+                        filtered_chunks.append(
+                            (
+                                ep_start + chunk_local_start,
+                                ep_start + chunk_local_end,
+                                chunk_local_start,
+                            )
+                        )
+
+                local_start = local_end
+
+        return filtered_chunks
 
     def _build_skill_boundaries(self):
         """Build per-episode skill boundary lookup from annotations.
@@ -437,97 +500,114 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # Streaming mode: we will load the episode at the current streaming index, and then increment the index for next call
         # Randomize chunk index on first call
-        if self.current_streaming_chunk_idx is None:
+        if not hasattr(self, "_active_chunks") or self._active_chunks is None:
             worker_info = get_worker_info()
             worker_id = 0 if worker_info is None else worker_info.id
             num_workers = 1 if worker_info is None else worker_info.num_workers
-            if not hasattr(self, "_active_chunks") or self._active_chunks is None:
-                indices = list(range(worker_id, len(self.chunks), num_workers))
-                worker_chunks = [self.chunks[i] for i in indices]
+            indices = list(range(worker_id, len(self.chunks), num_workers))
+            worker_chunks = [self.chunks[i] for i in indices]
+            if not worker_chunks:
+                worker_chunks = list(self.chunks)
+            if self.shuffle:
                 rng = np.random.default_rng(self.seed + worker_id)
                 rng.shuffle(worker_chunks)
-                self._active_chunks = worker_chunks
-            rng = np.random.default_rng(self.seed + worker_id)
-            self.current_streaming_chunk_idx = rng.integers(0, len(self._active_chunks)).item()
-            self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
-        # Current chunk iterated, move to next chunk
-        if self.current_streaming_frame_idx >= self._active_chunks[self.current_streaming_chunk_idx][1]:
-            self.current_streaming_chunk_idx += 1
-            # All data iterated, restart from beginning
-            if self.current_streaming_chunk_idx >= len(self._active_chunks):
+            self._active_chunks = worker_chunks
+
+            if self.current_streaming_chunk_idx is not None:
+                self.current_streaming_chunk_idx = min(self.current_streaming_chunk_idx, len(self._active_chunks) - 1)
+            self.current_streaming_frame_idx = None
+
+        if self.current_streaming_chunk_idx is None or self.current_streaming_frame_idx is None:
+            worker_info = get_worker_info()
+            worker_id = 0 if worker_info is None else worker_info.id
+            if self.shuffle:
+                rng = np.random.default_rng(self.seed + worker_id)
+                self.current_streaming_chunk_idx = rng.integers(0, len(self._active_chunks)).item()
+            else:
                 self.current_streaming_chunk_idx = 0
             self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
-            self._should_obs_loaders_reload = True
-        item = self.hf_dataset[self.current_streaming_frame_idx]
-        item.pop("observation.task_info")
-        ep_idx = item["episode_index"].item()
 
-        if self._should_obs_loaders_reload:
-            for loader in self.obs_loaders.values():
-                loader.close()
-            self.obs_loaders = dict()
-            # reload video loaders for new episode
-            self.current_streaming_episode_idx = ep_idx
-            for vid_key in self.meta.video_keys:
-                kwargs = {}
-                task_id = item["task_index"].item()
-                if "seg_instance_id" in vid_key:
-                    # load id list
-                    with open(
-                        self.root / "meta/episodes" / f"task-{task_id:04d}" / f"episode_{ep_idx:08d}.json",
-                    ) as f:
-                        meta = json.load(f)
-                        instance_id_mapping = json.loads(meta["ins_id_mapping"])
-                        instance_id_mapping = {int(k): v for k, v in instance_id_mapping.items()}
-                        self.omnigibson_mapping[ep_idx]["instance_id_mapping"] = instance_id_mapping
-                        self.omnigibson_mapping[ep_idx]["unique_ins_ids"][vid_key.split(".")[-1]] = meta[
-                            f"{ROBOT_CAMERA_NAMES['R1Pro'][vid_key.split('.')[-1]]}::unique_ins_ids"
-                        ]
-                        kwargs["id_list"] = th.tensor(
-                            self.omnigibson_mapping[ep_idx]["unique_ins_ids"][vid_key.split(".")[-1]]
+        while True:
+            # Current chunk iterated, move to next chunk
+            if self.current_streaming_frame_idx >= self._active_chunks[self.current_streaming_chunk_idx][1]:
+                self.current_streaming_chunk_idx += 1
+                # All data iterated, restart from beginning
+                if self.current_streaming_chunk_idx >= len(self._active_chunks):
+                    self.current_streaming_chunk_idx = 0
+                self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
+                self._should_obs_loaders_reload = True
+            item = self.hf_dataset[self.current_streaming_frame_idx]
+            item.pop("observation.task_info")
+            ep_idx = item["episode_index"].item()
+
+            if self._should_obs_loaders_reload:
+                for loader in self.obs_loaders.values():
+                    loader.close()
+                self.obs_loaders = dict()
+                # reload video loaders for new episode
+                self.current_streaming_episode_idx = ep_idx
+                for vid_key in self.meta.video_keys:
+                    kwargs = {}
+                    task_id = item["task_index"].item()
+                    if "seg_instance_id" in vid_key:
+                        # load id list
+                        with open(
+                            self.root / "meta/episodes" / f"task-{task_id:04d}" / f"episode_{ep_idx:08d}.json",
+                        ) as f:
+                            meta = json.load(f)
+                            instance_id_mapping = json.loads(meta["ins_id_mapping"])
+                            instance_id_mapping = {int(k): v for k, v in instance_id_mapping.items()}
+                            self.omnigibson_mapping[ep_idx]["instance_id_mapping"] = instance_id_mapping
+                            self.omnigibson_mapping[ep_idx]["unique_ins_ids"][vid_key.split(".")[-1]] = meta[
+                                f"{ROBOT_CAMERA_NAMES['R1Pro'][vid_key.split('.')[-1]]}::unique_ins_ids"
+                            ]
+                            kwargs["id_list"] = th.tensor(
+                                self.omnigibson_mapping[ep_idx]["unique_ins_ids"][vid_key.split(".")[-1]]
+                            )
+                    if "rgb" in vid_key:
+                        kwargs["train_rgb_type"] = self.train_rgb_type
+                    self.obs_loaders[vid_key] = iter(
+                        OBS_LOADER_MAP[vid_key.split(".")[2]](
+                            data_path=self.root,
+                            task_id=task_id,
+                            camera_id=vid_key.split(".")[-1],
+                            demo_id=f"{ep_idx:08d}",
+                            start_idx=self._active_chunks[self.current_streaming_chunk_idx][2],
+                            start_idx_is_keyframe=False,
+                            batch_size=1,
+                            stride=1,
+                            **kwargs,
                         )
-                if "rgb" in vid_key:
-                    kwargs["train_rgb_type"] = self.train_rgb_type
-                self.obs_loaders[vid_key] = iter(
-                    OBS_LOADER_MAP[vid_key.split(".")[2]](
-                        data_path=self.root,
-                        task_id=task_id,
-                        camera_id=vid_key.split(".")[-1],
-                        demo_id=f"{ep_idx:08d}",
-                        start_idx=self._active_chunks[self.current_streaming_chunk_idx][2],
-                        start_idx_is_keyframe=False,
-                        batch_size=1,
-                        stride=1,
-                        **kwargs,
                     )
-                )
-            self._should_obs_loaders_reload = False
+                self._should_obs_loaders_reload = False
 
-        query_indices = None
-        if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(self.current_streaming_frame_idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
-            item = {**item, **padding}
-            for key, val in query_result.items():
-                item[key] = val
+            query_indices = None
+            if self.delta_indices is not None:
+                query_indices, padding = self._get_query_indices(self.current_streaming_frame_idx, ep_idx)
+                query_result = self._query_hf_dataset(query_indices)
+                item = {**item, **padding}
+                for key, val in query_result.items():
+                    item[key] = val
 
-        task_skill = self._get_current_task_skill(item)
-        weight = skill_weight(task_skill, self.skill_list)
-        if not random.choices([True, False], weights=[weight, 1 - weight])[0]:
-            self.current_streaming_frame_idx += 1
-            for key in self.meta.video_keys:
-                next(self.obs_loaders[key])[0]
-            return self.__getitem__(idx)
-
-        # skip frames that fall in gaps between skill ranges
-        if self.skill_labels is not None:
-            ep_idx_val = item["episode_index"].item()
-            frame_index_val = round(item["timestamp"].item() * self.fps)
-            if self._is_gap_frame(ep_idx_val, frame_index_val):
+            task_skill = self._get_current_task_skill(item)
+            weight = skill_weight(task_skill, self.skill_list)
+            if not random.choices([True, False], weights=[weight, 1 - weight])[0]:
                 self.current_streaming_frame_idx += 1
                 for key in self.meta.video_keys:
                     next(self.obs_loaders[key])[0]
-                return self.__getitem__(idx)
+                continue
+
+            # skip frames that fall in gaps between skill ranges
+            if self.skill_labels is not None:
+                ep_idx_val = item["episode_index"].item()
+                frame_index_val = round(item["timestamp"].item() * self.fps)
+                if self._is_gap_frame(ep_idx_val, frame_index_val):
+                    self.current_streaming_frame_idx += 1
+                    for key in self.meta.video_keys:
+                        next(self.obs_loaders[key])[0]
+                    continue
+
+            break
 
         # load visual observations
         for key in self.meta.video_keys:
@@ -566,9 +646,47 @@ class BehaviorLeRobotDataset(LeRobotDataset):
     def _get_current_task_skill(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
         frame_index = round(item["timestamp"].item() * self.fps)
+        if (skill_annotation := self._get_annotation_skill(ep_idx, frame_index)) is not None:
+            return self._get_annotation_skill_name(skill_annotation)
         sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
         task_skill = self.meta.orchestrators[ep_idx][1][sub_idx]["task"]
         return task_skill
+
+    def _get_annotation_skill(self, ep_idx: int, frame_index: int) -> dict | None:
+        annotation = self.meta.annotations.get(ep_idx)
+        if annotation is None:
+            return None
+
+        skills = sorted(annotation.get("skill_annotation", []), key=lambda skill: skill["skill_idx"])
+        for skill in skills:
+            start_frame, end_frame = skill["frame_duration"]
+            if start_frame <= frame_index < end_frame:
+                return skill
+
+        if not skills:
+            return None
+        starts = [skill["frame_duration"][0] for skill in skills]
+        skill_idx = min(max(bisect.bisect_right(starts, frame_index) - 1, 0), len(skills) - 1)
+        return skills[skill_idx]
+
+    def _get_annotation_skill_name(self, skill_annotation: dict) -> str:
+        descriptions = skill_annotation.get("skill_description") or []
+        return descriptions[0] if descriptions else ""
+
+    def _format_annotation_object(self, object_id: str) -> str:
+        parts = object_id.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            object_id = parts[0]
+        return object_id.replace("_", " ")
+
+    def _get_annotation_prompt(self, skill_annotation: dict) -> str:
+        skill = self._get_annotation_skill_name(skill_annotation)
+        objects = skill_annotation.get("object_id") or [[]]
+        primary_objects = objects[0] if objects else []
+        if self.fine_grained_level <= 1 or not primary_objects:
+            return skill
+        object_text = " and ".join(self._format_annotation_object(obj) for obj in primary_objects)
+        return f"{skill} {object_text}".strip()
 
     def _get_fine_grained_task(self, item: dict) -> str:
         if self.skill_labels is not None:
@@ -576,6 +694,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         ep_idx = item["episode_index"].item()
         task_idx = item["task_index"].item()
         frame_index = round(item["timestamp"].item() * self.fps)
+        if (skill_annotation := self._get_annotation_skill(ep_idx, frame_index)) is not None:
+            return self._get_annotation_prompt(skill_annotation)
         try:
             sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
             task_text = self.meta.orchestrators[ep_idx][self.fine_grained_level][sub_idx]["task"]
@@ -760,6 +880,8 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
                             for episode in sorted((orchestrators_path / f"task-{task:04d}").iterdir())
                         }
                     )
+        elif self.annotations:
+            orchestrators = build_orchestrators_from_annotations(self.annotations, self.episodes)
         return orchestrators
 
     def get_annotation_path(self, ep_index: int) -> Path:
@@ -856,6 +978,73 @@ def load_orchestrators_data(episode_path_or_level_0_task, episode_len):
         for i in range(len(output_data)):
             output_data[i] = output_data[0]
     return output_data
+
+
+def _annotation_object_to_text(object_id: str) -> str:
+    parts = str(object_id).split("_")
+    if len(parts) > 1 and parts[-1].isdigit():
+        parts = parts[:-1]
+    return " ".join(parts)
+
+
+def build_orchestrators_from_annotations(annotations: dict, episodes: dict) -> dict:
+    orchestrators = {}
+    for ep_idx, episode_data in sorted(episodes.items()):
+        ann = annotations.get(ep_idx)
+        episode_len = episode_data["length"]
+        task_name = episode_data["tasks"][0]
+
+        if ann is None or "skill_annotation" not in ann or not ann["skill_annotation"]:
+            orchestrators[ep_idx] = {
+                i: [{"task": task_name, "start_frame": 0, "end_frame": episode_len - 1}]
+                for i in range(4)
+            }
+            continue
+
+        output_data = defaultdict(list)
+        output_data[0].append({"task": task_name, "start_frame": 0, "end_frame": episode_len - 1})
+
+        for skill_ann in ann["skill_annotation"]:
+            skill_desc = (skill_ann.get("skill_description") or [""])[0]
+            frame_duration = skill_ann.get("frame_duration") or [0, episode_len]
+            start_frame = int(frame_duration[0] if isinstance(frame_duration[0], (int, float)) else frame_duration[0][0])
+            end_raw = frame_duration[1] if isinstance(frame_duration[1], (int, float)) else frame_duration[1][-1]
+            end_frame = int(end_raw) - 1
+
+            prompt = skill_desc
+            object_groups = skill_ann.get("object_id") or []
+            if skill_desc == "move to" and object_groups and object_groups[0]:
+                prompt = f"move to {_annotation_object_to_text(object_groups[0][0])}"
+            elif skill_desc == "pick up from" and object_groups and len(object_groups[0]) >= 2:
+                object_text = _annotation_object_to_text(object_groups[0][0])
+                source_text = _annotation_object_to_text(object_groups[0][1])
+                prompt = f"pick up {object_text} from {source_text}"
+            elif skill_desc == "press" and object_groups and object_groups[0]:
+                prompt = f"press {_annotation_object_to_text(object_groups[0][0])}"
+            elif skill_desc == "place on" and object_groups and len(object_groups[0]) >= 2:
+                object_text = _annotation_object_to_text(object_groups[0][0])
+                target_text = _annotation_object_to_text(object_groups[0][1])
+                prompt = f"place {object_text} on {target_text}"
+
+            level1_segment = {
+                "task": skill_desc,
+                "skill": skill_desc,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+            }
+            level2_segment = {
+                "task": prompt,
+                "skill": skill_desc,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+            }
+            output_data[1].append(level1_segment)
+            output_data[2].append(level2_segment)
+            output_data[3].append(level2_segment.copy())
+
+        orchestrators[ep_idx] = dict(output_data)
+
+    return orchestrators
 
 
 def skill_weight(cur_skill, skill_list: list[str]) -> float:
